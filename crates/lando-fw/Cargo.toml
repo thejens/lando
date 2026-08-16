@@ -21,7 +21,6 @@ embassy-futures = "0.1"
 
 cortex-m = { version = "0.7", features = ["inline-asm"] }
 cortex-m-rt = "0.7"
-panic-halt = "1"
 log = "0.4"
 static_cell = "2"
 cyw43 = { version = "0.7", features = ["firmware-logs"] }

@@ -39,10 +39,16 @@ use crate::logln;
 /// this list is the limit of what the subnet route actually reaches. 37193 is
 /// the Lyngdorf's UPnP control port; the rest are the ports a LAN device is
 /// most likely to answer on.
-/// Ports repeat on purpose. smoltcp has no accept queue, so one socket serves
-/// one connection at a time — and a browser loading a page opens several at
-/// once, which with a single listener per port deadlocks behind the first.
-pub const PORTS: [u16; 8] = [80, 80, 80, 443, 443, 1400, 37193, 37193];
+/// Ports repeat on purpose, and repeat generously.
+///
+/// smoltcp has no accept queue: a port with no free listener does not queue
+/// the connection, it refuses it. A browser opens around six connections per
+/// host for one page, so a short table does not merely slow a page down — it
+/// drops whichever resources arrive after the listeners run out, which renders
+/// as a page with its text but none of its images.
+pub const PORTS: [u16; 14] = [
+    80, 80, 80, 80, 80, 80, 443, 443, 443, 443, 1400, 1400, 37193, 37193,
+];
 
 /// Per-socket buffers. Small deliberately: four listeners plus the LAN side
 /// have to coexist in 520 KB alongside a TLS session and the netmap parser.
@@ -283,9 +289,12 @@ impl Tunnel {
 pub async fn serve(stack: Stack<'static>, tunnel: &crate::TunnelShared) -> ! {
     // Fixed workers rather than a task per connection: without an allocator
     // the concurrency limit has to be a constant, and making it visible here
-    // is better than discovering it as a stall. Three is the minimum an
-    // ordinary web page needs — a browser opens several connections at once.
-    let (a, _, _) = embassy_futures::join::join3(
+    // is better than discovering it as a stall. Five rather than three because
+    // a browser opens around six connections for one page, and a worker is
+    // occupied for the whole life of a connection, not just its request.
+    let (a, _, _, _, _) = embassy_futures::join::join5(
+        worker(stack, tunnel),
+        worker(stack, tunnel),
         worker(stack, tunnel),
         worker(stack, tunnel),
         worker(stack, tunnel),
@@ -346,6 +355,9 @@ async fn splice(
     // truncates the response instead, which looks like the LAN host closing
     // the connection early.
     let mut held = [0u8; 512];
+    // A backstop against any path that leaks a worker: no bytes either way for
+    // this long and the connection is over, whatever either side believes.
+    let mut last_activity = Instant::now();
     // Indices rather than a slice: the same buffer is read into again once
     // drained, which a borrow of it would forbid.
     let mut pending = 0usize..0usize;
@@ -364,16 +376,29 @@ async fn splice(
             } else {
                 0
             };
-            (n, false)
+            // The client having sent FIN with nothing left buffered is the end
+            // of the exchange. Without this check a keep-alive connection is
+            // never torn down: the LAN host holds its side open by design, so
+            // the loop waits forever on a reply that is not coming and the
+            // worker is consumed for good. A handful of requests then exhausts
+            // the pool and everything after them hangs.
+            let peer_done = !socket.may_recv() && n == 0;
+            (n, peer_done)
         });
         if closed {
             return;
         }
-        if from_peer > 0
-            && embedded_io_async::Write::write_all(&mut lan, &buf[..from_peer])
+        if from_peer > 0 {
+            last_activity = Instant::now();
+            if embedded_io_async::Write::write_all(&mut lan, &buf[..from_peer])
                 .await
                 .is_err()
-        {
+            {
+                return;
+            }
+        }
+        if Instant::now() - last_activity > Duration::from_secs(20) {
+            logln!("tunnel: {}:{} idle, closing", dst, port);
             return;
         }
 
@@ -416,7 +441,10 @@ async fn splice(
                     flush(tunnel, handle).await;
                     return;
                 }
-                Ok(n) => pending = 0..n,
+                Ok(n) => {
+                    last_activity = Instant::now();
+                    pending = 0..n;
+                }
             }
         }
     }
@@ -427,7 +455,7 @@ async fn splice(
 /// Bounded because a peer that stops reading must not pin the single
 /// connection slot indefinitely.
 async fn flush(tunnel: &crate::TunnelShared, handle: SocketHandle) {
-    for _ in 0..200 {
+    for _ in 0..50 {
         let done = tunnel.lock(|t| {
             let mut t = t.borrow_mut();
             t.poll(Instant::now());

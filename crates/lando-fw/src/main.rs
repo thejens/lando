@@ -49,7 +49,73 @@ use heapless::String;
 use crate::config::{Config, Store};
 use static_cell::StaticCell;
 
-use panic_halt as _;
+/// A panic message that survives the reset that follows it.
+///
+/// The board has no debug probe, so a panic is otherwise invisible: the device
+/// simply reboots, and from the outside that is indistinguishable from a
+/// network stall. `.uninit` is not zeroed by the startup code, so a message
+/// written here is still readable after the watchdog restarts the chip.
+mod panic_report {
+    use core::fmt::Write as _;
+    use core::mem::MaybeUninit;
+    use core::sync::atomic::{compiler_fence, Ordering};
+
+    const MAGIC: u32 = 0x4c41_4e44;
+    const LEN: usize = 192;
+
+    #[repr(C)]
+    pub struct Report {
+        magic: u32,
+        len: u32,
+        text: [u8; LEN],
+    }
+
+    #[unsafe(link_section = ".uninit.PANIC")]
+    static mut REPORT: MaybeUninit<Report> = MaybeUninit::uninit();
+
+    /// Returns the previous boot's panic message, if it ended in one.
+    ///
+    /// Clears the marker so the same panic is reported once rather than after
+    /// every subsequent reset.
+    pub fn take() -> Option<heapless::String<LEN>> {
+        // Safety: single-threaded at the point this is called, before any task
+        // is spawned, and the region is only touched here and on panic.
+        let report = unsafe { &mut *core::ptr::addr_of_mut!(REPORT) };
+        let report = unsafe { report.assume_init_mut() };
+        if report.magic != MAGIC {
+            return None;
+        }
+        report.magic = 0;
+        let len = (report.len as usize).min(LEN);
+        let text = core::str::from_utf8(&report.text[..len]).ok()?;
+        heapless::String::try_from(text).ok()
+    }
+
+    #[panic_handler]
+    fn panic(info: &core::panic::PanicInfo) -> ! {
+        let report = unsafe { &mut *core::ptr::addr_of_mut!(REPORT) };
+        let report = unsafe { report.assume_init_mut() };
+        let mut text: heapless::String<LEN> = heapless::String::new();
+        // Location alone identifies the fault; the message is written after it
+        // so a long message cannot push the file and line out of the buffer.
+        if let Some(loc) = info.location() {
+            let _ = core::write!(&mut text, "{}:{} ", loc.file(), loc.line());
+        }
+        let _ = core::write!(&mut text, "{}", info.message());
+
+        let bytes = text.as_bytes();
+        let len = bytes.len().min(LEN);
+        report.text[..len].copy_from_slice(&bytes[..len]);
+        report.len = len as u32;
+        report.magic = MAGIC;
+        compiler_fence(Ordering::SeqCst);
+
+        // Reboot rather than halt. The watchdog would do it anyway after its
+        // timeout; doing it here means the report is read back promptly and
+        // the device is not silently dead in between.
+        cortex_m::peripheral::SCB::sys_reset()
+    }
+}
 
 bind_interrupts!(struct Irqs {
     USBCTRL_IRQ => InterruptHandler<USB>;
@@ -586,6 +652,9 @@ async fn main(spawner: Spawner) {
     let class = CdcAcmClass::new(&mut builder, CDC_STATE.init(State::new()), 64);
     let usb = builder.build();
 
+    if let Some(report) = panic_report::take() {
+        logln!("PANIC on previous boot: {}", report.as_str());
+    }
     spawner.spawn(watchdog_task(watchdog)).unwrap();
     spawner.spawn(usb_task(usb)).unwrap();
     spawner.spawn(console_task(class, store)).unwrap();

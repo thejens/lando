@@ -263,7 +263,7 @@ pub async fn serve(stack: Stack<'static>, node: &Shared, tunnel: &crate::TunnelS
 /// by its own task: it has to keep reading frames while this side is writing,
 /// and sharing the TLS connection between them would mean interleaving reads
 /// and writes on one buffer.
-pub static DERP_OUT: embassy_sync::channel::Channel<CriticalSectionRawMutex, Relayed, 2> =
+pub static DERP_OUT: embassy_sync::channel::Channel<CriticalSectionRawMutex, Relayed, 4> =
     embassy_sync::channel::Channel::new();
 
 /// One packet on its way to the relay.

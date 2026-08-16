@@ -262,61 +262,165 @@ where
     // by node key, and the relay has no notion of a "connection" to reply on.
     let mut peer_key: Option<[u8; KEY_LEN]> = None;
 
+    // Every piece of parser state lives here rather than inside the future
+    // that waits for bytes.
+    //
+    // This loop has to read and write on one connection: a peer reached
+    // through the relay has replies to send while the relay still has frames
+    // to deliver. Waiting on either alone deadlocks the other, so the two are
+    // raced — and whichever loses is cancelled mid-flight. Anything held in
+    // that future's locals is silently lost when it is.
+    //
+    // The failure that costs is losing how far through the staging buffer we
+    // had read while `reader` has already consumed those bytes: the next
+    // attempt re-feeds them, the frame stream desynchronises, and every packet
+    // after that is garbage. It presents as the relay working exactly once —
+    // the first request succeeds and nothing afterwards does.
+    //
+    // So the only cancellable await here is the raw read, whose own state
+    // lives inside the TLS connection, and the parse runs to completion
+    // without awaiting at all.
     let mut out = [0u8; 1600];
+    let mut assembled = [0u8; 1600];
+    let mut filled = 0usize;
+    let mut pos = 0usize;
+
     loop {
-        // Reading and writing are interleaved on one connection: a peer
-        // reached through the relay has replies to send while the relay still
-        // has frames to deliver, and waiting on either alone deadlocks the
-        // other.
+        // Drain outbound first, and unconditionally.
+        //
+        // The select below only runs when there is nothing left to parse, so
+        // a steady arrival of frames would mean never reaching it — outbound
+        // packets would queue until the channel filled and were dropped, which
+        // stalls exactly the replies the peer is waiting for. Sending here
+        // involves no race, so nothing can be cancelled.
+        if let Some(peer) = peer_key {
+            while let Ok(relayed) = crate::wg::DERP_OUT.try_receive() {
+                send_packet(tls, &peer, relayed.as_slice()).await?;
+            }
+        }
+
+        // Parse whatever is already staged before waiting for more.
+        let mut frame = None;
+        while pos < *staged_len {
+            let (used, parsed) = reader
+                .feed(&staged[pos..*staged_len])
+                .map_err(|_| DerpError::Protocol)?;
+            pos += used;
+            match parsed {
+                None => {
+                    if used == 0 {
+                        break;
+                    }
+                }
+                Some(Frame::Control { kind, payload }) => {
+                    let src = payload.as_slice();
+                    let take = src.len().min(assembled.len());
+                    assembled[..take].copy_from_slice(&src[..take]);
+                    frame = Some((kind, take));
+                    break;
+                }
+                Some(Frame::Body { kind, chunk, end, .. }) => {
+                    let take = chunk.len().min(assembled.len() - filled);
+                    assembled[filled..filled + take].copy_from_slice(&chunk[..take]);
+                    filled += take;
+                    if end {
+                        frame = Some((kind, filled));
+                        filled = 0;
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Reclaim the consumed prefix so the buffer does not fill with bytes
+        // already parsed.
+        if pos > 0 {
+            staged.copy_within(pos..*staged_len, 0);
+            *staged_len -= pos;
+            pos = 0;
+        }
+
+        if let Some((kind, len)) = frame {
+            handle_frame(tls, node, tunnel, kind, &assembled[..len], &mut out, &mut peer_key)
+                .await?;
+            continue;
+        }
+
+        // Nothing more to parse. All state is in `reader`, `staged` and
+        // `filled`, so waiting here loses nothing if it is cancelled.
+        if *staged_len == staged.len() {
+            return Err(DerpError::Protocol);
+        }
         let next = embassy_futures::select::select(
-            next_frame(reader, staged, staged_len, tls),
+            tls.read(&mut staged[*staged_len..]),
             crate::wg::DERP_OUT.receive(),
         )
         .await;
-        let (kind, payload, len) = match next {
-            embassy_futures::select::Either::First(frame) => frame?,
+        match next {
+            embassy_futures::select::Either::First(result) => {
+                let n = result.map_err(|_| DerpError::Io)?;
+                if n == 0 {
+                    return Err(DerpError::Io);
+                }
+                *staged_len += n;
+            }
             embassy_futures::select::Either::Second(relayed) => {
                 if let Some(peer) = peer_key {
                     send_packet(tls, &peer, relayed.as_slice()).await?;
                 }
-                continue;
             }
-        };
-        match kind {
-            FrameType::RecvPacket if len > KEY_LEN => {
-                // `src node key | packet`. The key is both the sender's
-                // identity and the address any reply has to go back to.
-                let mut src = [0u8; KEY_LEN];
-                src.copy_from_slice(&payload[..KEY_LEN]);
-                peer_key = Some(src);
-                let action = node.lock(|n| {
-                    n.borrow_mut().handle(
-                        &payload[KEY_LEN..len],
-                        crate::wg::Source::Derp(src),
-                        &mut out,
-                    )
-                });
-                match action {
-                    Some(crate::wg::Action::Reply(n)) => {
-                        send_packet(tls, &src, &out[..n]).await?;
-                    }
-                    Some(crate::wg::Action::Deliver(n)) => {
-                        tunnel.lock(|t| t.borrow_mut().deliver(&out[..n]));
-                    }
-                    None => {}
-                }
-            }
-            // Answering keeps the relay from deciding we are gone.
-            FrameType::Ping if len >= 8 => {
-                write_frame(tls, FrameType::Pong, &payload[..8]).await?;
-            }
-            FrameType::KeepAlive => {}
-            FrameType::PeerGone => logln!("derp: a peer left the relay"),
-            FrameType::Restarting => logln!("derp: relay is restarting"),
-            FrameType::Health if len > 0 => logln!("derp: relay reports a health problem"),
-            _ => {}
         }
     }
+}
+
+/// Acts on one received frame.
+async fn handle_frame<S>(
+    tls: &mut S,
+    node: &crate::wg::Shared,
+    tunnel: &crate::TunnelShared,
+    kind: FrameType,
+    payload: &[u8],
+    out: &mut [u8; 1600],
+    peer_key: &mut Option<[u8; KEY_LEN]>,
+) -> Result<(), DerpError>
+where
+    S: Write,
+{
+    match kind {
+        FrameType::RecvPacket if payload.len() > KEY_LEN => {
+            // `src node key | packet`. The key is both the sender's identity
+            // and the address any reply has to go back to.
+            let mut src = [0u8; KEY_LEN];
+            src.copy_from_slice(&payload[..KEY_LEN]);
+            *peer_key = Some(src);
+            let action = node.lock(|n| {
+                n.borrow_mut().handle(
+                    &payload[KEY_LEN..],
+                    crate::wg::Source::Derp(src),
+                    out,
+                )
+            });
+            match action {
+                Some(crate::wg::Action::Reply(n)) => send_packet(tls, &src, &out[..n]).await?,
+                Some(crate::wg::Action::Deliver(n)) => {
+                    tunnel.lock(|t| t.borrow_mut().deliver(&out[..n]));
+                }
+                None => {}
+            }
+        }
+        // Answering keeps the relay from deciding we are gone.
+        FrameType::Ping if payload.len() >= 8 => {
+            write_frame(tls, FrameType::Pong, &payload[..8]).await?;
+        }
+        FrameType::KeepAlive => {}
+        FrameType::PeerGone => logln!("derp: a peer left the relay"),
+        FrameType::Restarting => logln!("derp: relay is restarting"),
+        FrameType::Health if !payload.is_empty() => {
+            logln!("derp: relay reports a health problem")
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 /// Sends a packet to a peer through the relay.
