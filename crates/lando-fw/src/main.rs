@@ -318,6 +318,37 @@ async fn register(
     Ok(status)
 }
 
+/// Logs what the control plane believes about this device.
+///
+/// `HomeDERP` is the field that matters: peers are told where to reach a node
+/// through it, and without one nothing routes no matter what the device
+/// advertises.
+fn report_self(netmap: &[u8]) {
+    use tailscale_core::json::{self, Value};
+    let Ok(Some(node)) = json::field(netmap, "Node") else {
+        logln!("self: no Node record in the netmap");
+        return;
+    };
+    let Value::Raw(node) = node else { return };
+    let get = |k: &str| json::field(node, k).ok().flatten();
+
+    let home = match get("HomeDERP") {
+        Some(Value::Number(n)) => n,
+        _ => "none",
+    };
+    let derp = get("DERP").and_then(|v| v.as_str()).unwrap_or("none");
+    logln!("self: HomeDERP={} DERP={}", home, derp);
+    match get("Endpoints") {
+        Some(Value::Raw(r)) => logln!("self: endpoints {} bytes advertised", r.len()),
+        _ => logln!("self: no endpoints recorded"),
+    }
+    let hostinfo_fields = match get("Hostinfo") {
+        Some(Value::Raw(h)) => h.len(),
+        _ => 0,
+    };
+    logln!("self: hostinfo {} bytes stored", hostinfo_fields);
+}
+
 /// Holds the netmap long-poll open, which is what makes the node report
 /// online — that status is driven by this poll, not by registration.
 async fn map_poll(
@@ -347,6 +378,7 @@ async fn map_poll(
             // arrives here, and nothing on the device consumes peers yet.
             omit_peers: true,
             endpoints: &[endpoint],
+            endpoint_types: &[tailscale_core::control::endpoint_type::LOCAL],
             home_derp: 0,
         },
     )
@@ -356,6 +388,13 @@ async fn map_poll(
     let mut frames = tailscale_core::control::MapFrames::new();
     let mut count = 0u32;
     let mut current = 0usize;
+    // Buffer the first frame so our own Node record can be inspected. That
+    // record is where the control plane reports what it believes about this
+    // device — in particular whether it has published a home relay, without
+    // which peers are never told where to reach us.
+    let mut netmap = [0u8; 8192];
+    let mut netmap_len = 0usize;
+    let mut reported = false;
     conn.post_stream(
         socket,
         host,
@@ -374,9 +413,19 @@ async fn map_poll(
                     continue;
                 }
                 current += frame.chunk.len();
+                if !reported {
+                    let room = netmap.len() - netmap_len;
+                    let take = room.min(frame.chunk.len());
+                    netmap[netmap_len..netmap_len + take].copy_from_slice(&frame.chunk[..take]);
+                    netmap_len += take;
+                }
                 if frame.end {
                     count += 1;
                     logln!("map: frame {} ({} bytes) — node is online", count, current);
+                    if !reported {
+                        reported = true;
+                        report_self(&netmap[..netmap_len]);
+                    }
                     current = 0;
                 }
             }

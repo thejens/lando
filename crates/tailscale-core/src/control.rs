@@ -221,6 +221,12 @@ pub struct MapRequest<'a> {
     /// cheapest way to be reachable on a LAN — and avoids a TLS stack the
     /// relay path would otherwise require.
     pub endpoints: &'a [&'a str],
+    /// Parallel to `endpoints`, one [`endpoint_type`] per entry.
+    ///
+    /// The control plane pairs these by position, and an absent or
+    /// mismatched array is grounds to discard the endpoints entirely — with
+    /// no error, so the node simply appears to have none.
+    pub endpoint_types: &'a [u8],
     /// Relay region we are reachable through, or 0 for none.
     ///
     /// **Advertising this is what makes the node reachable at all.** A node
@@ -228,6 +234,18 @@ pub struct MapRequest<'a> {
     /// with nowhere to send, so they never send anything — and the symptom is
     /// simply silence, with no error at either end.
     pub home_derp: u32,
+}
+
+/// How an endpoint was learned. The control plane pairs these with
+/// `MapRequest.Endpoints` by position.
+pub mod endpoint_type {
+    pub const UNKNOWN: u8 = 0;
+    /// Discovered from a local interface — a LAN address.
+    pub const LOCAL: u8 = 1;
+    pub const STUN: u8 = 2;
+    pub const PORTMAPPED: u8 = 3;
+    pub const STUN4_LOCAL_PORT: u8 = 4;
+    pub const EXPLICIT_CONF: u8 = 5;
 }
 
 /// Placeholder address family Tailscale uses to express "reachable via relay
@@ -299,6 +317,15 @@ pub fn write_map_request(out: &mut [u8], req: &MapRequest) -> Result<usize, Json
             w.str_value(core::str::from_utf8(ep).map_err(|_| JsonError::Malformed)?)?;
         }
         w.end_array()?;
+
+        if !req.endpoint_types.is_empty() {
+            w.key("EndpointTypes")?;
+            w.begin_array()?;
+            for t in req.endpoint_types {
+                w.u64_value(*t as u64)?;
+            }
+            w.end_array()?;
+        }
     }
     w.key("Hostinfo")?;
     req.hostinfo.write(&mut w)?;
@@ -698,6 +725,7 @@ mod tests {
                 keep_alive: true,
                 omit_peers: false,
                 endpoints: &[],
+                endpoint_types: &[],
                 home_derp: 0,
             },
         )
@@ -730,6 +758,7 @@ mod tests {
                 keep_alive: true,
                 omit_peers: false,
                 endpoints: &[],
+                endpoint_types: &[],
                 home_derp: 12,
             },
         )
@@ -753,6 +782,7 @@ mod tests {
                 keep_alive: true,
                 omit_peers: false,
                 endpoints: &[],
+                endpoint_types: &[],
                 home_derp: 12,
             },
         )

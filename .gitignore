@@ -16,3 +16,9 @@
 # binary licence, not this repo's MIT — fetched by `make cyw43-firmware`
 # rather than vendored, so the licences stay separate.
 /crates/lando-fw/cyw43-firmware
+
+# Hosted-tailnet pre-auth key.
+.lando-tskey
+
+# Tailscale API access token (full tailnet admin).
+.lando-tsapi
