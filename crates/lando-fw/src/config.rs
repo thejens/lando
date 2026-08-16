@@ -24,7 +24,7 @@ pub const FLASH_SIZE: usize = 4 * 1024 * 1024;
 pub const CONFIG_OFFSET: u32 = (FLASH_SIZE - ERASE_SIZE) as u32;
 
 const MAGIC: &[u8; 8] = b"LANDOCFG";
-const VERSION: u8 = 1;
+const VERSION: u8 = 2;
 pub const MAX_FIELD: usize = 96;
 
 /// What the device needs to reach the tailnet, none of which belongs in the
@@ -36,6 +36,14 @@ pub struct Config {
     /// Tailnet pre-auth key. Only needed for the first registration; after
     /// that the node key in this sector is what identifies the device.
     pub auth_key: String<MAX_FIELD>,
+    /// Noise static identifying this device to the control plane.
+    pub machine_key: Option<[u8; 32]>,
+    /// WireGuard static identifying this node within the tailnet.
+    ///
+    /// Persisting both is what makes a reboot a *refresh* rather than a new
+    /// registration. Regenerating them would create a second node and consume
+    /// another auth-key use every time the device restarts.
+    pub node_key: Option<[u8; 32]>,
 }
 
 impl Config {
@@ -74,10 +82,30 @@ impl Store {
             String::try_from(text).ok()
         };
 
+        let ssid = read_field()?;
+        let password = read_field()?;
+        let auth_key = read_field().unwrap_or_default();
+
+        // Keys are optional so a config written before the device had any
+        // still loads; they are generated and saved on first registration.
+        let mut read_key = || -> Option<[u8; 32]> {
+            let present = *buf.get(pos)?;
+            pos += 1;
+            if present != 1 {
+                return None;
+            }
+            let mut k = [0u8; 32];
+            k.copy_from_slice(buf.get(pos..pos + 32)?);
+            pos += 32;
+            Some(k)
+        };
+
         Some(Config {
-            ssid: read_field()?,
-            password: read_field()?,
-            auth_key: read_field().unwrap_or_default(),
+            ssid,
+            password,
+            auth_key,
+            machine_key: read_key(),
+            node_key: read_key(),
         })
     }
 
@@ -96,6 +124,20 @@ impl Store {
             buf[pos] = bytes.len() as u8;
             buf[pos + 1..pos + 1 + bytes.len()].copy_from_slice(bytes);
             pos += 1 + bytes.len();
+        }
+
+        for key in [&config.machine_key, &config.node_key] {
+            match key {
+                Some(k) => {
+                    buf[pos] = 1;
+                    buf[pos + 1..pos + 33].copy_from_slice(k);
+                    pos += 33;
+                }
+                None => {
+                    buf[pos] = 0;
+                    pos += 1;
+                }
+            }
         }
 
         self.flash
