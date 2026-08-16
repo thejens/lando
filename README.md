@@ -33,7 +33,10 @@ Early. The control-plane path works against the real hosted control plane.
 | TCP over the tunnel (smoltcp) | working |
 | SOCKS5 proxy to the LAN | working — reaches a real LAN device |
 | Transparent port-forward | working — no client configuration at all |
-| RP2350 firmware | not started |
+| RP2350 firmware — USB console | working — logs, and reboots to bootloader on `b` |
+| RP2350 firmware — WiFi join | working — associates in ~3 s |
+| RP2350 firmware — network stack | not started |
+| USB provisioning to flash | not started |
 
 A node registered by `lando-host` shows up in the admin console as a real
 machine, gets a tailnet address and a MagicDNS name, reports *online*, and

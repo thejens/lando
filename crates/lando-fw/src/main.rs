@@ -253,14 +253,30 @@ async fn main(spawner: Spawner) {
     let (ssid, pass) = wifi_credentials();
     logln!("radio: joining {:?} ({} char key)", ssid, pass.len());
     let started = embassy_time::Instant::now();
-    match control.join(ssid, cyw43::JoinOptions::new(pass.as_bytes())).await {
-        Ok(_) => logln!("radio: joined in {} ms", started.elapsed().as_millis()),
-        Err(e) => logln!("radio: join failed: {:?}", e),
-    }
+    let joined = control
+        .join(ssid, cyw43::JoinOptions::new(pass.as_bytes()))
+        .await;
+    let status: String<64> = match &joined {
+        Ok(_) => {
+            let mut s: String<64> = String::new();
+            let _ = core::write!(&mut s, "joined in {} ms", started.elapsed().as_millis());
+            s
+        }
+        Err(e) => {
+            let mut s: String<64> = String::new();
+            let _ = core::write!(&mut s, "join failed: {:?}", e);
+            s
+        }
+    };
+    logln!("radio: {}", status);
 
+    // The status rides on every tick rather than being logged once at boot:
+    // the host opens the CDC port during enumeration, so anything written
+    // before an actual reader attaches is drained into a connection nobody is
+    // listening to, and boot-time output is effectively unobservable.
     let mut ticks = 0u32;
     loop {
-        logln!("alive, tick {}", ticks);
+        logln!("tick {} — radio: {}", ticks, status);
         ticks = ticks.wrapping_add(1);
         Timer::after(Duration::from_secs(5)).await;
     }
