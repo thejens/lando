@@ -39,9 +39,9 @@ Early. The control-plane path works against the real hosted control plane.
 | RP2350 firmware — ts2021 control channel | working — Noise handshake with the real control plane |
 | RP2350 firmware — HTTP/2 + registration | working — the board registers itself as a node |
 | RP2350 firmware — netmap long-poll | working — the board reports **online** |
-| RP2350 firmware — WireGuard responder (UDP) | implemented, unreachable without disco |
-| disco (endpoint validation) | not started — blocks all direct paths |
-| RP2350 firmware — DERP | not started |
+| RP2350 firmware — WireGuard responder (UDP) | working — session established with a real client |
+| disco (endpoint validation) | working — direct paths validate |
+| RP2350 firmware — DERP | not started — only needed behind NAT |
 | USB provisioning to flash | working — image carries no secrets |
 
 A node registered by `lando-host` shows up in the admin console as a real
@@ -144,6 +144,10 @@ Some of this is undocumented, so a few findings worth recording:
   nonce layout, but WireGuard counts little-endian and ts2021 big-endian. The
   netmap's frame length prefix is little-endian too, while every other length
   on the control connection is big-endian.
+- **disco is not optional.** A peer probes a candidate endpoint and will not
+  send WireGuard there until it gets a disco pong, so a node that cannot answer
+  disco is unreachable on every direct path no matter what its netmap
+  advertises. The symptom is total silence at both ends.
 - **WireGuard's `mac1` uses BLAKE2s in keyed mode, not HMAC** — while its KDF
   uses HMAC. Swapping them yields handshakes a peer drops without reply, which
   is indistinguishable from a firewall problem.

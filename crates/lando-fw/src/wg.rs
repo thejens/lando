@@ -12,7 +12,8 @@
 use embassy_net::udp::{PacketMetadata, UdpSocket};
 use embassy_net::Stack;
 
-use tailscale_core::key::{NodePrivate, NodePublic};
+use tailscale_core::disco;
+use tailscale_core::key::{DiscoPrivate, DiscoPublic, NodePrivate, NodePublic};
 use tailscale_core::tsmp;
 use tailscale_core::wireguard::handshake::Responder;
 use tailscale_core::wireguard::{Session, MSG_INITIATION, MSG_TRANSPORT};
@@ -32,7 +33,17 @@ struct PeerSlot {
 }
 
 /// Serves WireGuard until the socket fails.
-pub async fn serve(stack: Stack<'static>, node_key: &NodePrivate, index_seed: u32) -> ! {
+pub async fn serve(
+    stack: Stack<'static>,
+    node_key: &NodePrivate,
+    disco_key: &DiscoPrivate,
+    index_seed: u32,
+) -> ! {
+    let disco_public: DiscoPublic = disco_key.public();
+    // Nonces must never repeat for a key. A counter seeded from the TRNG is
+    // sufficient here and costs nothing to carry.
+    let mut nonce = [0u8; disco::NONCE_LEN];
+    nonce[..4].copy_from_slice(&index_seed.to_le_bytes());
     let mut rx_meta = [PacketMetadata::EMPTY; 8];
     let mut rx_buf = [0u8; 2048];
     let mut tx_meta = [PacketMetadata::EMPTY; 8];
@@ -56,6 +67,39 @@ pub async fn serve(stack: Stack<'static>, node_key: &NodePrivate, index_seed: u3
             continue;
         };
         let from = (meta.endpoint.addr, meta.endpoint.port);
+
+        // disco and WireGuard share this socket; the magic tells them apart.
+        // Answering disco is what makes a peer willing to send WireGuard here
+        // at all -- without a pong it never validates the endpoint.
+        if let Ok((header, sealed)) = disco::parse_header(&packet[..n]) {
+            let mut scratch = [0u8; 256];
+            let Ok(plain) = disco::open(disco_key.as_bytes(), &header, sealed, &mut scratch) else {
+                continue;
+            };
+            let Ok(ping) = disco::parse_ping(plain) else {
+                continue;
+            };
+            let embassy_net::IpAddress::Ipv4(src) = meta.endpoint.addr;
+            // Bump before use so no two pongs share a nonce.
+            bump(&mut nonce);
+            let mut out = [0u8; 256];
+            let Ok(len) = disco::write_pong(
+                disco_key.as_bytes(),
+                &disco_public,
+                &header.sender,
+                &nonce,
+                &ping.tx_id,
+                src.octets(),
+                meta.endpoint.port,
+                &mut out,
+            ) else {
+                continue;
+            };
+            let _ = socket.send_to(&out[..len], meta.endpoint).await;
+            logln!("disco: ping answered, endpoint validated");
+            continue;
+        }
+
         let Some(&kind) = packet.first() else { continue };
 
         match kind {
@@ -116,6 +160,16 @@ pub async fn serve(stack: Stack<'static>, node_key: &NodePrivate, index_seed: u3
                 }
             }
             _ => {}
+        }
+    }
+}
+
+/// Increments a nonce, treated as a little-endian counter.
+fn bump(nonce: &mut [u8; disco::NONCE_LEN]) {
+    for byte in nonce.iter_mut() {
+        *byte = byte.wrapping_add(1);
+        if *byte != 0 {
+            return;
         }
     }
 }

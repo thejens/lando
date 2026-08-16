@@ -620,6 +620,9 @@ async fn main(spawner: Spawner) {
                                 }
                                 Ok(text) => {
                                     logln!("control: {}", text.as_str());
+                                    // One disco key: the netmap advertises it
+                                    // and the UDP responder opens pings with
+                                    // it, so they must be the same key.
                                     let mut disco = [0u8; 32];
                                     rand_core::RngCore::fill_bytes(&mut trng, &mut disco);
                                     let disco =
@@ -649,7 +652,7 @@ async fn main(spawner: Spawner) {
                                             &disco.public(),
                                             endpoint.as_str(),
                                         ),
-                                        wg::serve(stack, &node_key, wg_index),
+                                        wg::serve(stack, &node_key, &disco, wg_index),
                                     )
                                     .await;
                                     let polled = match polled {
