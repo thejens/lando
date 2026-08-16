@@ -325,6 +325,60 @@ impl MapFrames {
     }
 }
 
+/// What a netmap tells us about one peer.
+///
+/// Only the fields needed to reach it. Everything else in a `Node` — user
+/// profile, capabilities, timestamps — is deliberately ignored, because on a
+/// device with 520 KB of RAM the netmap is the largest thing that arrives and
+/// keeping less of it is the whole game.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PeerInfo<'a> {
+    pub node_key: NodePublic,
+    /// Absent for peers that predate disco or have not reported one.
+    pub disco_key: Option<DiscoPublic>,
+    /// Relay the peer is reachable through, or 0 if unknown. A peer with no
+    /// home relay cannot be reached indirectly at all.
+    pub home_derp: u32,
+    pub online: bool,
+    /// Raw JSON array of CIDRs this peer accepts traffic for. Kept unparsed
+    /// because routing decisions belong to the layer above.
+    pub allowed_ips: &'a [u8],
+}
+
+/// Iterates the peers in a netmap.
+///
+/// Malformed or unkeyed entries are skipped rather than failing the whole
+/// netmap: one peer the server describes in a way we do not understand should
+/// not cost us every other peer.
+pub fn peers(netmap: &[u8]) -> impl Iterator<Item = PeerInfo<'_>> + '_ {
+    let raw = match json::field(netmap, "Peers") {
+        Ok(Some(Value::Raw(r))) => r,
+        _ => &[],
+    };
+    json::elements(raw).filter_map(|entry| {
+        let Value::Raw(node) = entry else { return None };
+        let get = |k: &str| json::field(node, k).ok().flatten();
+        let node_key = NodePublic::parse(get("Key")?.as_str()?).ok()?;
+        Some(PeerInfo {
+            node_key,
+            disco_key: get("DiscoKey")
+                .and_then(|v| v.as_str())
+                .and_then(|s| DiscoPublic::parse(s).ok()),
+            home_derp: get("HomeDERP")
+                .and_then(|v| match v {
+                    Value::Number(n) => n.parse::<u32>().ok(),
+                    _ => None,
+                })
+                .unwrap_or(0),
+            online: get("Online").and_then(|v| v.as_bool()).unwrap_or(false),
+            allowed_ips: match get("AllowedIPs") {
+                Some(Value::Raw(r)) => r,
+                _ => &[],
+            },
+        })
+    })
+}
+
 /// The parts of `RegisterResponse` a headless device acts on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RegisterResponse<'a> {
@@ -638,6 +692,58 @@ mod tests {
         assert_eq!(frame.total_len, 0);
         assert!(frame.end);
         assert!(frame.chunk.is_empty());
+    }
+
+    #[test]
+    fn extracts_peers_from_a_netmap() {
+        let nm = br#"{
+          "Node":{"Name":"self"},
+          "Peers":[
+            {"ID":1,"Key":"nodekey:0101010101010101010101010101010101010101010101010101010101010101",
+             "DiscoKey":"discokey:0202020202020202020202020202020202020202020202020202020202020202",
+             "HomeDERP":7,"Online":true,"AllowedIPs":["100.64.0.1/32"]},
+            {"ID":2,"Key":"nodekey:0303030303030303030303030303030303030303030303030303030303030303",
+             "HomeDERP":0,"AllowedIPs":[]}
+          ]}"#;
+
+        let found: [Option<PeerInfo>; 2] = {
+            let mut it = peers(nm);
+            [it.next(), it.next()]
+        };
+        let a = found[0].unwrap();
+        assert_eq!(a.node_key.as_bytes()[0], 0x01);
+        assert_eq!(a.disco_key.unwrap().as_bytes()[0], 0x02);
+        assert_eq!(a.home_derp, 7);
+        assert!(a.online);
+        assert_eq!(a.allowed_ips, br#"["100.64.0.1/32"]"#);
+
+        let b = found[1].unwrap();
+        assert_eq!(b.node_key.as_bytes()[0], 0x03);
+        assert_eq!(b.disco_key, None, "DiscoKey is optional");
+        assert_eq!(b.home_derp, 0);
+        assert!(!b.online);
+
+        assert_eq!(peers(nm).count(), 2);
+    }
+
+    /// One peer described in a way we do not understand must not cost us the
+    /// rest of the netmap.
+    #[test]
+    fn malformed_peers_are_skipped_not_fatal() {
+        let nm = br#"{"Peers":[
+            {"ID":1},
+            {"Key":"not-a-node-key"},
+            {"Key":"nodekey:0404040404040404040404040404040404040404040404040404040404040404"}
+        ]}"#;
+        let found: [Option<PeerInfo>; 1] = [peers(nm).next()];
+        assert_eq!(found[0].unwrap().node_key.as_bytes()[0], 0x04);
+        assert_eq!(peers(nm).count(), 1);
+    }
+
+    #[test]
+    fn absent_peers_field_yields_nothing() {
+        assert_eq!(peers(br#"{"Node":{}}"#).count(), 0);
+        assert_eq!(peers(br#"{"Peers":[]}"#).count(), 0);
     }
 
     #[test]

@@ -257,6 +257,63 @@ pub fn field<'a>(json: &'a [u8], want: &str) -> Result<Option<Value<'a>>, JsonEr
     }
 }
 
+/// Iterates the elements of a JSON array without copying them.
+///
+/// Nested structures are skipped whole, so an element containing arrays or
+/// objects is returned intact rather than being descended into.
+pub fn elements(raw: &[u8]) -> Elements<'_> {
+    Elements {
+        p: Parser { s: raw, i: 0 },
+        started: false,
+        done: false,
+    }
+}
+
+pub struct Elements<'a> {
+    p: Parser<'a>,
+    started: bool,
+    done: bool,
+}
+
+impl<'a> Iterator for Elements<'a> {
+    type Item = Value<'a>;
+
+    fn next(&mut self) -> Option<Value<'a>> {
+        if self.done {
+            return None;
+        }
+        if !self.started {
+            self.started = true;
+            self.p.skip_ws();
+            if self.p.next() != Some(b'[') {
+                self.done = true;
+                return None;
+            }
+        } else {
+            self.p.skip_ws();
+            match self.p.next() {
+                Some(b',') => {}
+                _ => {
+                    self.done = true;
+                    return None;
+                }
+            }
+        }
+        self.p.skip_ws();
+        if self.p.peek() == Some(b']') {
+            self.done = true;
+            return None;
+        }
+        match self.p.parse_value() {
+            Ok(v) => Some(v),
+            Err(_) => {
+                self.done = true;
+                None
+            }
+        }
+    }
+}
+
 struct Parser<'a> {
     s: &'a [u8],
     i: usize,
