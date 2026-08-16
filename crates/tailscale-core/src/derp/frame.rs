@@ -82,6 +82,8 @@ pub enum DerpError {
     FrameTooLarge,
     /// The server's opening frame was not a well-formed `ServerKey`.
     BadServerKey,
+    /// A sealed payload failed to authenticate, or was too short to be one.
+    Crypto,
     ShortBuffer,
 }
 

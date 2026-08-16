@@ -17,8 +17,10 @@
 //! drives it, so the same framing serves both the host binary and the firmware.
 
 pub mod frame;
+pub mod handshake;
 
 pub use frame::{Frame, FrameReader, FrameType, MAX_FRAME_LEN};
+pub use handshake::{client_info_payload, open, seal};
 
 /// Sent by the server as the first thing on a new connection, ahead of its
 /// public key.
