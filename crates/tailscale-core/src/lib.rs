@@ -18,6 +18,7 @@
 
 pub mod control;
 pub mod crypto;
+pub mod derp;
 pub mod h2;
 pub mod json;
 pub mod key;
