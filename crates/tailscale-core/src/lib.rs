@@ -17,11 +17,13 @@
 #![cfg_attr(not(feature = "std"), no_std)]
 
 pub mod control;
+pub mod crypto;
 pub mod h2;
 pub mod json;
 pub mod key;
 pub mod noise;
 pub mod upgrade;
+pub mod wireguard;
 
 /// Capability version advertised to the control plane.
 ///

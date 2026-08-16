@@ -24,7 +24,9 @@ Early. The control-plane path works against the real hosted control plane.
 | `POST /machine/register` | working — registers and authorizes |
 | Identity persistence across restarts | working |
 | `POST /machine/map` (netmap long-poll) | working — node reports online |
-| WireGuard data plane | not started |
+| WireGuard handshake (both roles) | implemented, not yet interop-tested |
+| WireGuard transport + replay window | implemented, not yet interop-tested |
+| WireGuard timers / rekey / cookies | not started |
 | DERP relay client | not started |
 | TCP port-forward / SOCKS5 | not started |
 | RP2350 firmware | not started |
@@ -96,6 +98,17 @@ Some of this is undocumented, so a few findings worth recording:
   65535 bytes and the connection then stalls silently.
 - Noise frames cap at 4096 bytes, so the record layer needs one fixed buffer
   regardless of message size. Everything above it has to stream.
+- **WireGuard disagrees with ts2021 on byte order.** Same cipher, same 12-byte
+  nonce layout, but WireGuard counts little-endian and ts2021 big-endian. The
+  netmap's frame length prefix is little-endian too, while every other length
+  on the control connection is big-endian.
+- **WireGuard's `mac1` uses BLAKE2s in keyed mode, not HMAC** — while its KDF
+  uses HMAC. Swapping them yields handshakes a peer drops without reply, which
+  is indistinguishable from a firewall problem.
+
+"Implemented, not yet interop-tested" above means exactly that: the WireGuard
+handshake round-trips against its own responder and both halves derive matching
+keys, which proves self-consistency, not that a real peer will talk to it.
 
 ## Caveats
 

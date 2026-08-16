@@ -15,10 +15,10 @@
 //! layer needs one fixed 4 KB buffer no matter how large the logical message
 //! is — everything above it (HTTP/2, JSON) has to stream.
 
-use blake2::{Blake2s256, Digest};
 use chacha20poly1305::aead::AeadInPlace;
 use chacha20poly1305::{ChaCha20Poly1305, KeyInit, Nonce, Tag};
 
+use crate::crypto;
 use crate::key::{MachinePrivate, MachinePublic, KEY_LEN};
 
 const PROTOCOL_NAME: &[u8] = b"Noise_IK_25519_ChaChaPoly_BLAKE2s";
@@ -62,66 +62,6 @@ pub enum NoiseError {
     NonceExhausted,
 }
 
-fn blake2s(data: &[u8]) -> [u8; 32] {
-    let mut h = Blake2s256::new();
-    h.update(data);
-    h.finalize().into()
-}
-
-/// BLAKE2s block size, needed for the HMAC pad construction.
-const BLAKE2S_BLOCK: usize = 64;
-
-/// HMAC-BLAKE2s (RFC 2104 over BLAKE2s).
-///
-/// Hand-rolled rather than taken from the `hmac` crate: RustCrypto's BLAKE2 has
-/// a `Lazy` buffer kind (it supports a native keyed mode) which `hmac::Hmac`
-/// cannot wrap. Note this is *not* BLAKE2s's own keyed mode — Noise and Go's
-/// `hkdf.New(newBLAKE2s, …)` both specify plain HMAC, and the two are not
-/// interchangeable.
-fn hmac_blake2s(key: &[u8], parts: &[&[u8]]) -> [u8; 32] {
-    let mut padded = [0u8; BLAKE2S_BLOCK];
-    if key.len() > BLAKE2S_BLOCK {
-        padded[..32].copy_from_slice(&blake2s(key));
-    } else {
-        padded[..key.len()].copy_from_slice(key);
-    }
-
-    let mut ipad = [0x36u8; BLAKE2S_BLOCK];
-    let mut opad = [0x5cu8; BLAKE2S_BLOCK];
-    for i in 0..BLAKE2S_BLOCK {
-        ipad[i] ^= padded[i];
-        opad[i] ^= padded[i];
-    }
-
-    let mut inner = Blake2s256::new();
-    inner.update(ipad);
-    for p in parts {
-        inner.update(p);
-    }
-    let inner: [u8; 32] = inner.finalize().into();
-
-    let mut outer = Blake2s256::new();
-    outer.update(opad);
-    outer.update(inner);
-    outer.finalize().into()
-}
-
-/// HKDF (RFC 5869) with BLAKE2s and an empty `info`, producing `N` 32-byte
-/// outputs — the exact shape Noise's `HKDF()` needs.
-fn hkdf<const N: usize>(salt: &[u8; 32], ikm: &[u8]) -> [[u8; 32]; N] {
-    let prk = hmac_blake2s(salt, &[ikm]);
-    let mut out = [[0u8; 32]; N];
-    for i in 0..N {
-        let counter = [(i + 1) as u8];
-        out[i] = if i == 0 {
-            hmac_blake2s(&prk, &[&counter])
-        } else {
-            hmac_blake2s(&prk, &[&out[i - 1], &counter])
-        };
-    }
-    out
-}
-
 /// Renders a `u16` as decimal without allocating. Returns the used prefix.
 fn decimal(v: u16, buf: &mut [u8; 5]) -> &[u8] {
     if v == 0 {
@@ -148,15 +88,12 @@ impl SymmetricState {
     fn initialize() -> Self {
         // PROTOCOL_NAME is 33 bytes, longer than BLAKE2s's 32-byte digest, so
         // the spec's "hash it" branch applies rather than the zero-pad branch.
-        let h = blake2s(PROTOCOL_NAME);
+        let h = crypto::hash(PROTOCOL_NAME);
         Self { h, ck: h }
     }
 
     fn mix_hash(&mut self, data: &[u8]) {
-        let mut hasher = Blake2s256::new();
-        hasher.update(self.h);
-        hasher.update(data);
-        self.h = hasher.finalize().into();
+        self.h = crypto::hash_parts(&[&self.h, data]);
     }
 
     /// `MixKey(X25519(priv, pub))`, returning the single-use cipher it derives.
@@ -165,7 +102,7 @@ impl SymmetricState {
     /// call the DH with two private or two public keys.
     fn mix_dh(&mut self, private: &MachinePrivate, public: &MachinePublic) -> ChaCha20Poly1305 {
         let dh = private.dh(public);
-        let [ck, k] = hkdf::<2>(&self.ck, &dh);
+        let [ck, k] = crypto::kdf::<2>(&self.ck, &dh);
         self.ck = ck;
         ChaCha20Poly1305::new_from_slice(&k).expect("32-byte key")
     }
@@ -219,7 +156,7 @@ impl SymmetricState {
     fn split(self) -> (ChaCha20Poly1305, ChaCha20Poly1305) {
         // Empty IKM, chaining key as salt — note this differs from mix_dh,
         // which passes the DH output as IKM.
-        let [k1, k2] = hkdf::<2>(&self.ck, &[]);
+        let [k1, k2] = crypto::kdf::<2>(&self.ck, &[]);
         (
             ChaCha20Poly1305::new_from_slice(&k1).expect("32-byte key"),
             ChaCha20Poly1305::new_from_slice(&k2).expect("32-byte key"),
@@ -430,52 +367,7 @@ mod tests {
         MachinePublic::parse_hex(s).unwrap().0
     }
 
-    /// The KDF is the piece most likely to be subtly wrong and it fails
-    /// opaquely — a bad chaining key just produces an undecryptable handshake
-    /// with no hint as to why. These vectors come from Python's `hmac` +
-    /// `hashlib.blake2s`, an independent implementation, so they catch a
-    /// self-consistent-but-wrong construction that a round-trip test cannot.
-    #[test]
-    fn hmac_blake2s_matches_reference() {
-        let key: [u8; 32] = core::array::from_fn(|i| i as u8);
-        assert_eq!(
-            hmac_blake2s(&key, &[b"tailscale"]),
-            h32("26dc379e5a2c2143f17cc1eec53fc7e1d5d2ec2a3f7470a8f261fb5271bbfcc4")
-        );
 
-        // Keys longer than the 64-byte block must be hashed down first.
-        let long: [u8; 100] = core::array::from_fn(|i| i as u8);
-        assert_eq!(
-            hmac_blake2s(&long, &[b"x"]),
-            h32("7c5a4a1c1150b1eadcba56974986fd860c4aca9cd69fa0c65c9f67dadad9883a")
-        );
-    }
-
-    #[test]
-    fn hkdf_matches_reference() {
-        // The MixDH case: chaining key as salt, DH output as IKM.
-        let out = hkdf::<2>(&[0xAA; 32], &[0xBB; 32]);
-        assert_eq!(
-            out[0],
-            h32("fe332fdec9cd425f88cdabe009f2d78aff433e89c9d38673f5158bc3f15cff34")
-        );
-        assert_eq!(
-            out[1],
-            h32("3e81c8bf9aaa02a751a3e2b6312cbf0900289ff68c6db75e3548eca281b0a75c")
-        );
-
-        // The Split case: empty IKM, which is easy to get wrong by passing the
-        // chaining key as IKM instead of as salt.
-        let out = hkdf::<2>(&[0xCC; 32], &[]);
-        assert_eq!(
-            out[0],
-            h32("9e0ffdb8cdbc6c9b346c6ff26db6c19274dbd993b1f83db3950be8b6b3948f3a")
-        );
-        assert_eq!(
-            out[1],
-            h32("e86d3d5ab526d67a864f80d225d2ee0b4bf8e9494edb9c00fbda33f33b0ae970")
-        );
-    }
 
     #[test]
     fn initial_state_hashes_the_protocol_name() {
