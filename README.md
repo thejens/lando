@@ -23,15 +23,16 @@ Early. The control-plane path works against the real hosted control plane.
 | HTTP/2 over Noise | working |
 | `POST /machine/register` | working — registers and authorizes |
 | Identity persistence across restarts | working |
-| `POST /machine/map` (netmap long-poll) | not started |
+| `POST /machine/map` (netmap long-poll) | working — node reports online |
 | WireGuard data plane | not started |
 | DERP relay client | not started |
 | TCP port-forward / SOCKS5 | not started |
 | RP2350 firmware | not started |
 
 A node registered by `lando-host` shows up in the admin console as a real
-machine. It will not report *online* until the map long-poll exists, since
-online status is driven by that, not by registration.
+machine, gets a tailnet address and a MagicDNS name, and reports *online* for
+as long as the map long-poll is held open. It is not yet reachable — that needs
+the WireGuard data plane.
 
 ## Layout
 

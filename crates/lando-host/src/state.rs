@@ -12,11 +12,15 @@
 
 use std::path::{Path, PathBuf};
 
-use tailscale_core::key::{MachinePrivate, NodePrivate};
+use tailscale_core::key::{DiscoPrivate, MachinePrivate, NodePrivate};
 
 pub struct State {
     pub machine_key: MachinePrivate,
     pub node_key: NodePrivate,
+    /// Authenticates endpoint discovery. The official client regenerates this
+    /// per process, but persisting it keeps peer state stable across restarts,
+    /// which matters more on a device that reboots than on a laptop.
+    pub disco_key: DiscoPrivate,
     path: PathBuf,
 }
 
@@ -32,18 +36,25 @@ impl State {
         if let Ok(text) = std::fs::read_to_string(path) {
             let machine = field(&text, "machine")?;
             let node = field(&text, "node")?;
-            return Ok((
-                Self {
-                    machine_key: MachinePrivate::from_bytes(machine),
-                    node_key: NodePrivate::from_bytes(node),
-                    path: path.to_path_buf(),
+            // A disco key added after the file was written is filled in rather
+            // than treated as corruption: regenerating the node key instead
+            // would create a second node and burn an auth-key use.
+            let state = Self {
+                machine_key: MachinePrivate::from_bytes(machine),
+                node_key: NodePrivate::from_bytes(node),
+                disco_key: match field(&text, "disco") {
+                    Ok(d) => DiscoPrivate::from_bytes(d),
+                    Err(_) => DiscoPrivate::generate(&mut rand_core::OsRng),
                 },
-                false,
-            ));
+                path: path.to_path_buf(),
+            };
+            state.save()?;
+            return Ok((state, false));
         }
         let state = Self {
             machine_key: MachinePrivate::generate(&mut rand_core::OsRng),
             node_key: NodePrivate::generate(&mut rand_core::OsRng),
+            disco_key: DiscoPrivate::generate(&mut rand_core::OsRng),
             path: path.to_path_buf(),
         };
         state.save()?;
@@ -52,9 +63,10 @@ impl State {
 
     pub fn save(&self) -> Result<(), String> {
         let body = format!(
-            "machine {}\nnode {}\n",
+            "machine {}\nnode {}\ndisco {}\n",
             hex(self.machine_key.as_bytes()),
-            hex(self.node_key.as_bytes())
+            hex(self.node_key.as_bytes()),
+            hex(self.disco_key.as_bytes())
         );
         std::fs::write(&self.path, body).map_err(|e| format!("writing {:?}: {e}", self.path))?;
         restrict(&self.path);

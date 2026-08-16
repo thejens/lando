@@ -10,7 +10,8 @@ mod transport;
 use std::time::Duration;
 
 use tailscale_core::control::{
-    self, parse_register_response, write_register_request, Hostinfo, Register, REGISTER_PATH,
+    self, parse_register_response, write_map_request, write_register_request, Hostinfo, MapFrames,
+    MapRequest, Register, MAP_PATH, REGISTER_PATH,
 };
 use tailscale_core::key::MachinePublic;
 use tailscale_core::{CAPABILITY_VERSION, DEFAULT_CONTROL_HOST};
@@ -29,6 +30,10 @@ const PINNED_CONTROL_KEY: &str =
 
 /// How long to wait for a browser to complete an interactive login.
 const LOGIN_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Read timeout while streaming the netmap. Generous because a quiet tailnet
+/// legitimately sends nothing between keep-alives.
+const MAP_POLL_TIMEOUT: Duration = Duration::from_secs(180);
 
 fn main() {
     if let Err(e) = run() {
@@ -165,9 +170,94 @@ fn run() -> Result<(), String> {
         println!("This tailnet requires manual device approval — approve it in the");
         println!("admin console before the node becomes reachable.");
     }
+    // The long-poll is what makes the node report online, so it runs until
+    // interrupted rather than returning.
     println!();
-    println!("Next: POST /machine/map to stream the netmap.");
-    Ok(())
+    println!("map          : POST {MAP_PATH} (streaming, uncompressed)");
+    conn.set_read_timeout(MAP_POLL_TIMEOUT)?;
+    poll_netmap(&mut conn, &host, &node_key, &state.disco_key.public(), &hostinfo)
+}
+
+/// Streams the netmap until the connection drops or the process is killed.
+fn poll_netmap(
+    conn: &mut H2Conn,
+    host: &str,
+    node_key: &tailscale_core::key::NodePublic,
+    disco_key: &tailscale_core::key::DiscoPublic,
+    hostinfo: &Hostinfo,
+) -> Result<(), String> {
+    let mut buf = vec![0u8; 4096];
+    let n = write_map_request(
+        &mut buf,
+        &MapRequest {
+            capability_version: CAPABILITY_VERSION,
+            node_key,
+            disco_key,
+            hostinfo,
+            stream: true,
+            keep_alive: true,
+            omit_peers: false,
+        },
+    )
+    .map_err(|e| format!("building MapRequest: {e:?}"))?;
+
+    let mut frames = MapFrames::new();
+    // The host can afford to assemble a frame before parsing it. The firmware
+    // cannot: a netmap can exceed the Pico's entire SRAM, so it will have to
+    // extract fields while streaming. The frame layer above is already
+    // streaming so that only this buffer has to change.
+    let mut current: Vec<u8> = Vec::new();
+    let mut count = 0usize;
+
+    conn.post(host, MAP_PATH, &buf[..n], move |mut data| {
+        while !data.is_empty() {
+            let (used, frame) = frames.feed(data);
+            if used == 0 && frame.is_none() {
+                break;
+            }
+            data = &data[used..];
+            let Some(frame) = frame else { continue };
+
+            if frame.total_len == 0 {
+                println!("  keep-alive");
+                continue;
+            }
+            current.extend_from_slice(frame.chunk);
+            if !frame.end {
+                continue;
+            }
+            count += 1;
+            println!("  netmap frame #{count}: {} bytes", current.len());
+            report_netmap(&current, count == 1);
+            current.clear();
+        }
+        Ok(())
+    })
+}
+
+/// Prints the few netmap fields that matter at this stage.
+fn report_netmap(body: &[u8], verbose: bool) {
+    let get = |k: &str| tailscale_core::json::field(body, k).ok().flatten();
+    if let Some(node) = get("Node") {
+        if let Some(addrs) = control::nested_raw(node, "Addresses") {
+            println!("    addresses : {}", String::from_utf8_lossy(addrs));
+        }
+        if verbose {
+            if let Some(name) = control::nested_str(node, "Name") {
+                println!("    name      : {name}");
+            }
+        }
+    }
+    if let Some(tailscale_core::json::Value::Raw(peers)) = get("Peers") {
+        // Cheap element count: peer objects are the only top-level braces.
+        let n = peers.iter().filter(|&&b| b == b'{').count();
+        println!("    peers     : ~{n}");
+    }
+    if let Some(err) = get("Error").and_then(|v| v.as_str()) {
+        if !err.is_empty() {
+            println!("    error     : {err}");
+        }
+    }
 }
 
 /// Issues one `RegisterRequest` and collects the response body.
