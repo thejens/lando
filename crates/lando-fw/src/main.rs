@@ -20,6 +20,8 @@
 #![no_std]
 #![no_main]
 
+mod config;
+
 use core::fmt::Write as _;
 
 use embassy_executor::Spawner;
@@ -35,8 +37,10 @@ use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::Channel;
 use embassy_time::{Duration, Timer};
 use embassy_usb::class::cdc_acm::{CdcAcmClass, State};
-use embassy_usb::{Builder, Config};
+use embassy_usb::{Builder, Config as UsbConfig};
 use heapless::String;
+
+use crate::config::{Config, Store};
 use static_cell::StaticCell;
 
 use panic_halt as _;
@@ -46,21 +50,6 @@ bind_interrupts!(struct Irqs {
     PIO0_IRQ_0 => PioInterruptHandler<PIO0>;
     DMA_IRQ_0 => embassy_rp::dma::InterruptHandler<DMA_CH0>;
 });
-
-/// WiFi credentials, baked into the image for now.
-///
-/// A stopgap: the device is meant to be provisioned over USB into a flash
-/// sector, so credentials never sit in a build artifact. Until that exists,
-/// this file is gitignored and the image is treated as sensitive.
-const WIFI_CONFIG: &str = include_str!("../../../.lando-wifi");
-
-fn wifi_credentials() -> (&'static str, &'static str) {
-    let mut lines = WIFI_CONFIG.lines();
-    (
-        lines.next().unwrap_or("").trim(),
-        lines.next().unwrap_or("").trim(),
-    )
-}
 
 /// RP2350 requires a signed image block in flash; without it the bootloader
 /// refuses to run the binary at all.
@@ -98,7 +87,7 @@ async fn usb_task(mut device: embassy_usb::UsbDevice<'static, Driver<'static, US
 }
 
 #[embassy_executor::task]
-async fn console_task(class: CdcAcmClass<'static, Driver<'static, USB>>) {
+async fn console_task(class: CdcAcmClass<'static, Driver<'static, USB>>, mut store: Store) {
     // Split once and let each half manage its own connection state, so output
     // and command handling are independent: a host that only reads must not
     // block the path that could reboot the board.
@@ -126,18 +115,30 @@ async fn console_task(class: CdcAcmClass<'static, Driver<'static, USB>>) {
     };
 
     let inp = async {
-        let mut buf = [0u8; 64];
+        let mut packet = [0u8; 64];
+        let mut line: String<160> = String::new();
+        let mut pending = store.load().unwrap_or_default();
         loop {
             rx.wait_connection().await;
             loop {
-                let Ok(n) = rx.read_packet(&mut buf).await else {
+                let Ok(n) = rx.read_packet(&mut packet).await else {
                     break;
                 };
-                for &b in &buf[..n] {
-                    if b == b'b' {
-                        // Hand the board back to the bootloader so the next
-                        // image can be flashed without anyone touching it.
-                        embassy_rp::rom_data::reset_to_usb_boot(0, 0);
+                for &b in &packet[..n] {
+                    match b {
+                        b'\r' | b'\n' => {
+                            handle_command(line.as_str(), &mut pending, &mut store);
+                            line.clear();
+                        }
+                        // Bare `b` stays a single-keystroke escape: it is the
+                        // only command that must work when everything else is
+                        // broken, including whatever is echoing our newlines.
+                        b'b' if line.is_empty() => {
+                            embassy_rp::rom_data::reset_to_usb_boot(0, 0);
+                        }
+                        _ => {
+                            let _ = line.push(b as char);
+                        }
                     }
                 }
             }
@@ -147,12 +148,71 @@ async fn console_task(class: CdcAcmClass<'static, Driver<'static, USB>>) {
     join(out, inp).await;
 }
 
+/// Runs one console command against the pending config.
+///
+/// Values are staged in memory and only reach flash on `save`, so a mistyped
+/// field can be corrected without leaving the sector half-written.
+fn handle_command(line: &str, pending: &mut Config, store: &mut Store) {
+    let line = line.trim();
+    let (cmd, value) = line.split_once(' ').unwrap_or((line, ""));
+    match cmd {
+        "" => {}
+        "ssid" => match String::try_from(value) {
+            Ok(v) => {
+                pending.ssid = v;
+                logln!("ssid staged ({} chars)", value.len());
+            }
+            Err(_) => logln!("ssid too long"),
+        },
+        "pass" => match String::try_from(value) {
+            Ok(v) => {
+                pending.password = v;
+                // Never echo the value, only that it landed.
+                logln!("password staged ({} chars)", value.len());
+            }
+            Err(_) => logln!("password too long"),
+        },
+        "key" => match String::try_from(value) {
+            Ok(v) => {
+                pending.auth_key = v;
+                logln!("auth key staged ({} chars)", value.len());
+            }
+            Err(_) => logln!("auth key too long"),
+        },
+        "save" => match store.save(pending) {
+            Ok(()) => logln!("saved to flash; reboot to apply"),
+            Err(()) => logln!("flash write failed"),
+        },
+        "clear" => match store.clear() {
+            Ok(()) => logln!("flash config erased"),
+            Err(()) => logln!("flash erase failed"),
+        },
+        "show" => {
+            let stored = store.load();
+            logln!(
+                "stored: {}  staged: ssid={} pass={} key={}",
+                if stored.is_some() { "yes" } else { "none" },
+                pending.ssid.len(),
+                pending.password.len(),
+                pending.auth_key.len()
+            );
+        }
+        "help" | "?" => {
+            logln!("ssid <v> | pass <v> | key <v> | save | clear | show | b=bootloader");
+        }
+        other => logln!("unknown command {:?} (try ?)", other),
+    }
+}
+
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
     let p = embassy_rp::init(Default::default());
     let driver = Driver::new(p.USB, Irqs);
 
-    let mut config = Config::new(0xc0de, 0xcafe);
+    let mut store = Store::new(p.FLASH);
+    let stored = store.load();
+
+    let mut config = UsbConfig::new(0xc0de, 0xcafe);
     config.manufacturer = Some("lando");
     config.product = Some("lando-fw");
     config.serial_number = Some("lando-0001");
@@ -180,7 +240,7 @@ async fn main(spawner: Spawner) {
     let usb = builder.build();
 
     spawner.spawn(usb_task(usb)).unwrap();
-    spawner.spawn(console_task(class)).unwrap();
+    spawner.spawn(console_task(class, store)).unwrap();
 
     // Enumeration has to finish before anything else is attempted, and the
     // host needs a moment after that before it will read what we write.
@@ -250,11 +310,24 @@ async fn main(spawner: Spawner) {
         .set_power_management(cyw43::PowerManagementMode::None)
         .await;
 
-    let (ssid, pass) = wifi_credentials();
-    logln!("radio: joining {:?} ({} char key)", ssid, pass.len());
+    let Some(cfg) = stored.filter(Config::is_complete) else {
+        logln!("unprovisioned — set credentials over this console, then reboot");
+        logln!("  ssid <name>");
+        logln!("  pass <passphrase>");
+        logln!("  save");
+        loop {
+            logln!("waiting for provisioning (type ? for help)");
+            Timer::after(Duration::from_secs(10)).await;
+        }
+    };
+
+    logln!("radio: joining {:?} ({} char key)", cfg.ssid.as_str(), cfg.password.len());
     let started = embassy_time::Instant::now();
     let joined = control
-        .join(ssid, cyw43::JoinOptions::new(pass.as_bytes()))
+        .join(
+            cfg.ssid.as_str(),
+            cyw43::JoinOptions::new(cfg.password.as_bytes()),
+        )
         .await;
     let status: String<64> = match &joined {
         Ok(_) => {
