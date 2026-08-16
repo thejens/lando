@@ -80,6 +80,10 @@ impl DerpClient {
         client.server_key = client.read_server_key()?;
         client.send_client_info(node_secret, node_public)?;
         client.read_server_info(node_secret)?;
+        // Claim this relay as our home. Without it the control plane never
+        // learns where to reach us, peers see no DERP address, and nothing is
+        // ever sent -- silently, with both ends believing they are fine.
+        client.note_preferred(true)?;
         Ok(client)
     }
 
@@ -164,6 +168,11 @@ impl DerpClient {
         Ok(json.to_vec())
     }
 
+    /// Marks this relay as our home, so peers are told to route through it.
+    pub fn note_preferred(&mut self, preferred: bool) -> Result<(), Error> {
+        self.write_frame(FrameType::NotePreferred, &[u8::from(preferred)])
+    }
+
     /// Sends a packet to a peer through the relay.
     ///
     /// Unused until the WireGuard datapath is wired to the relay; kept here
@@ -227,10 +236,21 @@ impl DerpClient {
                 self.pending.clear();
                 self.pos = 0;
                 let mut chunk = vec![0u8; 8192];
-                let n = self
-                    .tls
-                    .read(&mut chunk)
-                    .map_err(|e| format!("reading from relay: {e}"))?;
+                let n = match self.tls.read(&mut chunk) {
+                    Ok(n) => n,
+                    // A relay connection is idle most of the time; the socket
+                    // timeout marks liveness, not failure. Treating it as
+                    // fatal makes the node hang up on itself between packets.
+                    Err(e)
+                        if matches!(
+                            e.kind(),
+                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                        ) =>
+                    {
+                        continue
+                    }
+                    Err(e) => return Err(format!("reading from relay: {e}")),
+                };
                 if n == 0 {
                     return Err("relay closed the connection".into());
                 }

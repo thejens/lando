@@ -84,6 +84,12 @@ pub struct Hostinfo<'a> {
     pub os_version: &'a str,
     pub machine: &'a str,
     pub routable_ips: &'a [&'a str],
+    /// Relay region we are homed on, reported inside `NetInfo`.
+    ///
+    /// This is how peers learn where to reach us. The server relays it to them
+    /// as a `DERP` placeholder address and strips `NetInfo` itself, so the
+    /// field is invisible in a peer's netmap even when it is working.
+    pub preferred_derp: u32,
 }
 
 impl Default for Hostinfo<'_> {
@@ -95,6 +101,7 @@ impl Default for Hostinfo<'_> {
             os_version: "",
             machine: "thumbv8m",
             routable_ips: &[],
+            preferred_derp: 0,
         }
     }
 }
@@ -109,6 +116,12 @@ impl Hostinfo<'_> {
         }
         w.field_str("Hostname", self.hostname)?;
         w.field_str("Machine", self.machine)?;
+        if self.preferred_derp != 0 {
+            w.key("NetInfo")?;
+            w.begin_object()?;
+            w.field_u64("PreferredDERP", self.preferred_derp as u64)?;
+            w.end_object()?;
+        }
         if !self.routable_ips.is_empty() {
             w.key("RoutableIPs")?;
             w.begin_array()?;
@@ -198,6 +211,36 @@ pub struct MapRequest<'a> {
     /// Drop peer data. Useful for a first connection where only presence
     /// matters, and a real saving on a device that cannot hold a large netmap.
     pub omit_peers: bool,
+    /// Relay region we are reachable through, or 0 for none.
+    ///
+    /// **Advertising this is what makes the node reachable at all.** A node
+    /// with no home relay and no direct endpoints appears in peers' netmaps
+    /// with nowhere to send, so they never send anything — and the symptom is
+    /// simply silence, with no error at either end.
+    pub home_derp: u32,
+}
+
+/// Placeholder address family Tailscale uses to express "reachable via relay
+/// region N" in an endpoint list. The same encoding appears on peers' `DERP`
+/// fields, which is how [`peers`] reads it back.
+fn write_derp_endpoint(region: u32, out: &mut [u8; 24]) -> &[u8] {
+    const PREFIX: &[u8] = b"127.3.3.40:";
+    out[..PREFIX.len()].copy_from_slice(PREFIX);
+    let mut digits = [0u8; 10];
+    let mut n = region;
+    let mut i = 10;
+    if n == 0 {
+        i -= 1;
+        digits[i] = b'0';
+    }
+    while n > 0 {
+        i -= 1;
+        digits[i] = b'0' + (n % 10) as u8;
+        n /= 10;
+    }
+    let len = 10 - i;
+    out[PREFIX.len()..PREFIX.len() + len].copy_from_slice(&digits[i..]);
+    &out[..PREFIX.len() + len]
 }
 
 /// Serializes a `MapRequest` into `out`, returning its length.
@@ -233,6 +276,14 @@ pub fn write_map_request(out: &mut [u8], req: &MapRequest) -> Result<usize, Json
     }
     if req.omit_peers {
         w.field_bool("OmitPeers", true)?;
+    }
+    if req.home_derp != 0 {
+        let mut buf = [0u8; 24];
+        let ep = write_derp_endpoint(req.home_derp, &mut buf);
+        w.key("Endpoints")?;
+        w.begin_array()?;
+        w.str_value(core::str::from_utf8(ep).map_err(|_| JsonError::Malformed)?)?;
+        w.end_array()?;
     }
     w.key("Hostinfo")?;
     req.hostinfo.write(&mut w)?;
@@ -347,36 +398,52 @@ pub struct PeerInfo<'a> {
 
 /// Iterates the peers in a netmap.
 ///
+/// Reads **both** `Peers` and `PeersChanged`. This matters: the control plane
+/// routinely answers with only `PeersChanged`, and a client that looks solely
+/// at `Peers` concludes the tailnet is empty — with no error to explain why.
+///
 /// Malformed or unkeyed entries are skipped rather than failing the whole
 /// netmap: one peer the server describes in a way we do not understand should
 /// not cost us every other peer.
 pub fn peers(netmap: &[u8]) -> impl Iterator<Item = PeerInfo<'_>> + '_ {
-    let raw = match json::field(netmap, "Peers") {
+    let list = |k: &str| match json::field(netmap, k) {
         Ok(Some(Value::Raw(r))) => r,
-        _ => &[],
+        _ => &[][..],
     };
-    json::elements(raw).filter_map(|entry| {
-        let Value::Raw(node) = entry else { return None };
-        let get = |k: &str| json::field(node, k).ok().flatten();
-        let node_key = NodePublic::parse(get("Key")?.as_str()?).ok()?;
-        Some(PeerInfo {
-            node_key,
-            disco_key: get("DiscoKey")
-                .and_then(|v| v.as_str())
-                .and_then(|s| DiscoPublic::parse(s).ok()),
-            home_derp: get("HomeDERP")
-                .and_then(|v| match v {
-                    Value::Number(n) => n.parse::<u32>().ok(),
-                    _ => None,
-                })
-                .unwrap_or(0),
-            online: get("Online").and_then(|v| v.as_bool()).unwrap_or(false),
-            allowed_ips: match get("AllowedIPs") {
-                Some(Value::Raw(r)) => r,
-                _ => &[],
-            },
+    json::elements(list("Peers"))
+        .chain(json::elements(list("PeersChanged")))
+        .filter_map(|entry| {
+            let Value::Raw(node) = entry else { return None };
+            let get = |k: &str| json::field(node, k).ok().flatten();
+            let node_key = NodePublic::parse(get("Key")?.as_str()?).ok()?;
+            Some(PeerInfo {
+                node_key,
+                disco_key: get("DiscoKey")
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| DiscoPublic::parse(s).ok()),
+                home_derp: get("HomeDERP")
+                    .and_then(|v| match v {
+                        Value::Number(n) => n.parse::<u32>().ok(),
+                        _ => None,
+                    })
+                    .or_else(|| get("DERP").and_then(|v| derp_region(v.as_str()?)))
+                    .unwrap_or(0),
+                online: get("Online").and_then(|v| v.as_bool()).unwrap_or(false),
+                // `AllowedIPs` is often absent, in which case the peer's own
+                // addresses are the only routes it accepts.
+                allowed_ips: match get("AllowedIPs").or_else(|| get("Addresses")) {
+                    Some(Value::Raw(r)) => r,
+                    _ => &[],
+                },
+            })
         })
-    })
+}
+
+/// Extracts the region from the `DERP` field, which encodes a peer's home
+/// relay as a placeholder address of the form `127.3.3.40:<region>` rather
+/// than as a plain number.
+fn derp_region(s: &str) -> Option<u32> {
+    s.rsplit(':').next()?.parse().ok()
 }
 
 /// The parts of `RegisterResponse` a headless device acts on.
@@ -615,6 +682,7 @@ mod tests {
                 stream: true,
                 keep_alive: true,
                 omit_peers: false,
+                home_derp: 0,
             },
         )
         .unwrap();
@@ -625,6 +693,65 @@ mod tests {
         assert!(s.contains(r#""KeepAlive":true"#));
         assert!(s.contains(r#""DiscoKey":"discokey:"#));
         assert!(!s.contains("OmitPeers"));
+    }
+
+    /// Advertising a home relay is what makes a node reachable; without it
+    /// peers have nowhere to send and simply stay silent.
+    #[test]
+    fn map_request_advertises_the_home_relay() {
+        let node = NodePrivate::from_bytes([5u8; 32]).public();
+        let disco = crate::key::DiscoPrivate::from_bytes([6u8; 32]).public();
+        let hi = Hostinfo::default();
+        let mut buf = [0u8; 1024];
+        let n = write_map_request(
+            &mut buf,
+            &MapRequest {
+                capability_version: 145,
+                node_key: &node,
+                disco_key: &disco,
+                hostinfo: &hi,
+                stream: true,
+                keep_alive: true,
+                omit_peers: false,
+                home_derp: 12,
+            },
+        )
+        .unwrap();
+        assert!(as_str(&buf[..n]).contains(r#""Endpoints":["127.3.3.40:12"]"#));
+
+        // The same region also travels inside Hostinfo.NetInfo, which is what
+        // the server actually turns into a peer-visible DERP address.
+        let hi = Hostinfo {
+            preferred_derp: 12,
+            ..Default::default()
+        };
+        let n = write_map_request(
+            &mut buf,
+            &MapRequest {
+                capability_version: 145,
+                node_key: &node,
+                disco_key: &disco,
+                hostinfo: &hi,
+                stream: true,
+                keep_alive: true,
+                omit_peers: false,
+                home_derp: 12,
+            },
+        )
+        .unwrap();
+        assert!(as_str(&buf[..n]).contains(r#""NetInfo":{"PreferredDERP":12}"#));
+    }
+
+    #[test]
+    fn derp_endpoint_placeholder_round_trips() {
+        let mut b = [0u8; 24];
+        assert_eq!(write_derp_endpoint(1, &mut b), b"127.3.3.40:1");
+        assert_eq!(write_derp_endpoint(0, &mut b), b"127.3.3.40:0");
+        assert_eq!(write_derp_endpoint(255, &mut b), b"127.3.3.40:255");
+        // The writer and the reader must agree on the encoding.
+        let mut b = [0u8; 24];
+        let s = core::str::from_utf8(write_derp_endpoint(42, &mut b)).unwrap();
+        assert_eq!(derp_region(s), Some(42));
     }
 
     /// The length prefix is little-endian here, unlike every other length on
@@ -744,6 +871,41 @@ mod tests {
     fn absent_peers_field_yields_nothing() {
         assert_eq!(peers(br#"{"Node":{}}"#).count(), 0);
         assert_eq!(peers(br#"{"Peers":[]}"#).count(), 0);
+    }
+
+    /// The control plane routinely answers with only `PeersChanged`. Reading
+    /// just `Peers` makes a populated tailnet look empty, with no error.
+    #[test]
+    fn reads_peers_changed_as_well_as_peers() {
+        let nm = br#"{"PeersChanged":[
+            {"Key":"nodekey:0505050505050505050505050505050505050505050505050505050505050505",
+             "DiscoKey":"discokey:0606060606060606060606060606060606060606060606060606060606060606",
+             "DERP":"127.3.3.40:12","Online":true,"Addresses":["100.64.0.5/32"]}
+        ]}"#;
+        let found: [Option<PeerInfo>; 1] = [peers(nm).next()];
+        let p = found[0].unwrap();
+        assert_eq!(p.node_key.as_bytes()[0], 0x05);
+        assert_eq!(p.disco_key.unwrap().as_bytes()[0], 0x06);
+        // The home relay arrives as a placeholder address, not a number.
+        assert_eq!(p.home_derp, 12);
+        // Falls back to Addresses when AllowedIPs is absent.
+        assert_eq!(p.allowed_ips, br#"["100.64.0.5/32"]"#);
+    }
+
+    #[test]
+    fn both_peer_lists_are_read() {
+        let nm = br#"{
+          "Peers":[{"Key":"nodekey:0707070707070707070707070707070707070707070707070707070707070707"}],
+          "PeersChanged":[{"Key":"nodekey:0808080808080808080808080808080808080808080808080808080808080808"}]
+        }"#;
+        assert_eq!(peers(nm).count(), 2);
+    }
+
+    #[test]
+    fn derp_placeholder_address_parses() {
+        assert_eq!(derp_region("127.3.3.40:7"), Some(7));
+        assert_eq!(derp_region("127.3.3.40:0"), Some(0));
+        assert_eq!(derp_region("garbage"), None);
     }
 
     #[test]

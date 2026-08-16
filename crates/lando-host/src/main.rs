@@ -5,6 +5,7 @@
 //! nothing else — so a bug that reproduces here should never be chased there.
 
 mod derp;
+mod node;
 mod state;
 mod transport;
 
@@ -31,6 +32,11 @@ const PINNED_CONTROL_KEY: &str =
 
 /// How long to wait for a browser to complete an interactive login.
 const LOGIN_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Relay region we advertise as our home. Region 1 is NYC, which is where the
+/// default `derp1.tailscale.com` lives; the two must agree or peers will send
+/// to a relay we are not connected to.
+const DERP_HOME_REGION: u32 = 1;
 
 /// Read timeout while streaming the netmap. Generous because a quiet tailnet
 /// legitimately sends nothing between keep-alives.
@@ -75,11 +81,44 @@ fn derp_check(state: &State) -> Result<(), String> {
     }
 }
 
+/// Runs as a full node: control plane in a background thread to stay online,
+/// datapath in the foreground.
+///
+/// Two threads rather than one because both halves block indefinitely by
+/// design — the map long-poll is what keeps the node online, and the relay
+/// read is what makes it reachable. Neither may starve the other.
+fn node_mode() -> Result<(), String> {
+    let relay = std::env::var("LANDO_DERP").unwrap_or_else(|_| "derp1.tailscale.com".into());
+    let (state, _) = State::load_or_create(&State::path())?;
+    let known_peers: node::PeerSet = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+
+    let peers_for_control = known_peers.clone();
+    std::thread::spawn(move || {
+        if let Err(e) = control_plane(Some(peers_for_control), DERP_HOME_REGION) {
+            eprintln!("control plane stopped: {e}");
+        }
+    });
+
+    // Let registration and the first netmap land before answering handshakes,
+    // so the authorisation check has something to check against.
+    std::thread::sleep(Duration::from_secs(6));
+    node::run(&relay, &state.node_key, known_peers)
+}
+
 fn run() -> Result<(), String> {
+    if std::env::args().nth(1).as_deref() == Some("node") {
+        return node_mode();
+    }
     if std::env::args().nth(1).as_deref() == Some("derp") {
         let (state, _) = State::load_or_create(&State::path())?;
         return derp_check(&state);
     }
+    control_plane(None, 0)
+}
+
+/// Registers and holds the netmap long-poll open, optionally publishing the
+/// peer list for the datapath.
+fn control_plane(peers_out: Option<node::PeerSet>, home_derp: u32) -> Result<(), String> {
     let host = std::env::var("LANDO_CONTROL_HOST").unwrap_or_else(|_| DEFAULT_CONTROL_HOST.into());
     let key_str = std::env::var("LANDO_CONTROL_KEY").unwrap_or_else(|_| PINNED_CONTROL_KEY.into());
     let hostname = std::env::var("LANDO_HOSTNAME").unwrap_or_else(|_| "lando".into());
@@ -111,6 +150,7 @@ fn run() -> Result<(), String> {
     let auth_key = load_auth_key()?;
     let hostinfo = Hostinfo {
         hostname: &hostname,
+        preferred_derp: home_derp,
         ..Default::default()
     };
     let node_key = state.node_key.public();
@@ -212,7 +252,7 @@ fn run() -> Result<(), String> {
     println!();
     println!("map          : POST {MAP_PATH} (streaming, uncompressed)");
     conn.set_read_timeout(MAP_POLL_TIMEOUT)?;
-    poll_netmap(&mut conn, &host, &node_key, &state.disco_key.public(), &hostinfo)
+    poll_netmap(&mut conn, &host, &node_key, &state.disco_key.public(), &hostinfo, peers_out, home_derp)
 }
 
 /// Streams the netmap until the connection drops or the process is killed.
@@ -222,6 +262,8 @@ fn poll_netmap(
     node_key: &tailscale_core::key::NodePublic,
     disco_key: &tailscale_core::key::DiscoPublic,
     hostinfo: &Hostinfo,
+    peers_out: Option<node::PeerSet>,
+    home_derp: u32,
 ) -> Result<(), String> {
     let mut buf = vec![0u8; 4096];
     let n = write_map_request(
@@ -234,6 +276,7 @@ fn poll_netmap(
             stream: true,
             keep_alive: true,
             omit_peers: false,
+            home_derp,
         },
     )
     .map_err(|e| format!("building MapRequest: {e:?}"))?;
@@ -266,6 +309,18 @@ fn poll_netmap(
             count += 1;
             println!("  netmap frame #{count}: {} bytes", current.len());
             report_netmap(&current, count == 1);
+            if let Ok(path) = std::env::var("LANDO_DUMP_NETMAP") {
+                let _ = std::fs::write(&path, &current);
+            }
+            // Publish the peer list for the datapath. A delta frame that omits
+            // Peers leaves the previous list in place rather than clearing it.
+            if let Some(out) = &peers_out {
+                let found: Vec<_> = control::peers(&current).map(|p| p.node_key).collect();
+                if !found.is_empty() {
+                    println!("    peers     : {} known", found.len());
+                    *out.lock().unwrap() = found;
+                }
+            }
             current.clear();
         }
         Ok(())
