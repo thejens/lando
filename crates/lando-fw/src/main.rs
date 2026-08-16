@@ -22,6 +22,7 @@
 
 mod config;
 mod control;
+mod derp;
 mod h2conn;
 mod wg;
 
@@ -643,7 +644,35 @@ async fn main(spawner: Spawner) {
                                     // Both halves block forever by design: the
                                     // poll is what keeps the node online, the
                                     // UDP socket is what makes it reachable.
-                                    let polled = embassy_futures::select::select(
+                                    // Relay buffers are the largest single
+                                    // allocation in the firmware; keeping them
+                                    // static makes that cost explicit.
+                                    static DERP_BUFS: StaticCell<derp::Buffers> =
+                                        StaticCell::new();
+                                    static DERP_RX: StaticCell<[u8; 2048]> = StaticCell::new();
+                                    static DERP_TX: StaticCell<[u8; 2048]> = StaticCell::new();
+                                    let relay = async {
+                                        match derp::connect(
+                                            stack,
+                                            "derp1i.tailscale.com",
+                                            node_key.as_bytes(),
+                                            node_key.public().as_bytes(),
+                                            &mut trng,
+                                            DERP_BUFS.init(derp::Buffers::new()),
+                                            DERP_RX.init([0; 2048]),
+                                            DERP_TX.init([0; 2048]),
+                                        )
+                                        .await
+                                        {
+                                            Ok(_) => logln!("derp: handshake complete"),
+                                            Err(e) => logln!("derp: failed: {:?}", e),
+                                        }
+                                        // Hold the future open so the select
+                                        // keeps running the other two.
+                                        core::future::pending::<()>().await
+                                    };
+
+                                    let polled = embassy_futures::select::select3(
                                         map_poll(
                                             &mut conn,
                                             &mut socket,
@@ -653,11 +682,12 @@ async fn main(spawner: Spawner) {
                                             endpoint.as_str(),
                                         ),
                                         wg::serve(stack, &node_key, &disco, wg_index),
+                                        relay,
                                     )
                                     .await;
                                     let polled = match polled {
-                                        embassy_futures::select::Either::First(r) => r,
-                                        embassy_futures::select::Either::Second(_) => Ok(()),
+                                        embassy_futures::select::Either3::First(r) => r,
+                                        _ => Ok(()),
                                     };
                                     match polled {
                                         Ok(()) => {

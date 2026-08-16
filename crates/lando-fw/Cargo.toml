@@ -32,6 +32,7 @@ heapless = { version = "0.9", default-features = false }
 embassy-sync = "0.7"
 embassy-usb = "0.6"
 embedded-io-async = "0.7"
+embedded-tls = { version = "0.19.0", default-features = false }
 
 [profile.release]
 opt-level = "z"

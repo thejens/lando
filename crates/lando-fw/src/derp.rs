@@ -1,0 +1,265 @@
+//! DERP over TLS, on the device.
+//!
+//! This is what makes a NAT'd device reachable. Two peers that are both behind
+//! NAT cannot hole-punch without a side channel to coordinate through — that
+//! is how `CallMeMaybe` is delivered — so the relay is required even when the
+//! eventual path ends up direct.
+//!
+//! **Certificates are not verified here.** `embedded-tls` has no `no_std`
+//! certificate verification, so this is a constraint of the target rather than
+//! a choice. It is defensible only because of what DERP actually carries: no
+//! credential transits it (authentication is a NaCl box against the node key),
+//! and every relayed byte is already WireGuard-encrypted end to end. A
+//! man-in-the-middle therefore obtains ciphertext, traffic metadata, and the
+//! ability to drop packets — not decryption, forgery, or access. The host
+//! binary verifies properly; only the device makes this trade.
+
+use embassy_net::dns::DnsQueryType;
+use embassy_net::tcp::TcpSocket;
+use embassy_net::Stack;
+use embassy_time::Duration;
+use embedded_io_async::{Read, Write};
+use embedded_tls::{Aes128GcmSha256, TlsConfig, TlsConnection, TlsContext, UnsecureProvider};
+
+use tailscale_core::derp::frame::{write_header, FrameType, HEADER_LEN, KEY_LEN};
+use tailscale_core::derp::handshake::{client_info_payload, open, NONCE_LEN};
+use tailscale_core::derp::{parse_server_key, Frame, FrameReader, UPGRADE_PATH, UPGRADE_PROTOCOL};
+
+use crate::logln;
+
+/// A TLS record can be 16 KiB plus overhead, and the read buffer has to hold
+/// one whole. This is the single largest allocation in the firmware.
+const TLS_READ: usize = 16 * 1024 + 512;
+const TLS_WRITE: usize = 4 * 1024;
+
+#[derive(Debug)]
+pub enum DerpError {
+    Dns,
+    Connect,
+    Tls,
+    Io,
+    Upgrade,
+    Protocol,
+}
+
+pub struct Buffers {
+    tls_read: [u8; TLS_READ],
+    tls_write: [u8; TLS_WRITE],
+}
+
+impl Buffers {
+    pub const fn new() -> Self {
+        Self {
+            tls_read: [0; TLS_READ],
+            tls_write: [0; TLS_WRITE],
+        }
+    }
+}
+
+/// Connects to a relay and completes its handshake, reporting the server key.
+///
+/// Returns once the relay has accepted us; carrying packets is the next layer
+/// up and reuses the same connection.
+pub async fn connect<'a, R>(
+    stack: Stack<'static>,
+    host: &str,
+    node_secret: &[u8; KEY_LEN],
+    node_public: &[u8; KEY_LEN],
+    mut rng: R,
+    bufs: &'a mut Buffers,
+    rx_buf: &'a mut [u8; 2048],
+    tx_buf: &'a mut [u8; 2048],
+) -> Result<[u8; KEY_LEN], DerpError>
+where
+    R: embedded_tls::CryptoRngCore,
+{
+    // Drawn before the TLS provider takes ownership of the generator.
+    let mut nonce = [0u8; NONCE_LEN];
+    rng.fill_bytes(&mut nonce);
+
+    let addrs = stack
+        .dns_query(host, DnsQueryType::A)
+        .await
+        .map_err(|_| DerpError::Dns)?;
+    let addr = *addrs.first().ok_or(DerpError::Dns)?;
+    logln!("derp: {} -> {}", host, addr);
+
+    let mut socket = TcpSocket::new(stack, rx_buf, tx_buf);
+    socket.set_timeout(Some(Duration::from_secs(30)));
+    socket
+        .connect((addr, 443))
+        .await
+        .map_err(|_| DerpError::Connect)?;
+
+    let config = TlsConfig::new().with_server_name(host);
+    let mut tls: TlsConnection<_, Aes128GcmSha256> =
+        TlsConnection::new(socket, &mut bufs.tls_read, &mut bufs.tls_write);
+    tls.open(TlsContext::new(
+        &config,
+        UnsecureProvider::new::<Aes128GcmSha256>(rng),
+    ))
+    .await
+    .map_err(|_| DerpError::Tls)?;
+    logln!("derp: tls up (certificate not verified)");
+
+    // Switch the HTTPS connection into the DERP binary protocol.
+    let mut request = [0u8; 256];
+    let n = build_upgrade(host, &mut request);
+    tls.write_all(&request[..n]).await.map_err(|_| DerpError::Io)?;
+    tls.flush().await.map_err(|_| DerpError::Io)?;
+
+    let mut buf = [0u8; 1024];
+    let mut have = 0usize;
+    let body_at = loop {
+        if have == buf.len() {
+            return Err(DerpError::Upgrade);
+        }
+        let n = tls.read(&mut buf[have..]).await.map_err(|_| DerpError::Io)?;
+        if n == 0 {
+            return Err(DerpError::Io);
+        }
+        have += n;
+        if let Some(end) = find_headers_end(&buf[..have]) {
+            if !buf.starts_with(b"HTTP/1.1 101") {
+                return Err(DerpError::Upgrade);
+            }
+            break end;
+        }
+    };
+
+    // Anything past the headers is already framed DERP.
+    let mut reader = FrameReader::new();
+    let mut staged = [0u8; 1024];
+    let mut staged_len = have - body_at;
+    staged[..staged_len].copy_from_slice(&buf[body_at..have]);
+
+    let server_key = loop {
+        match next_frame(&mut reader, &mut staged, &mut staged_len, &mut tls).await? {
+            (FrameType::ServerKey, payload, len) => {
+                break parse_server_key(&payload[..len]).map_err(|_| DerpError::Protocol)?;
+            }
+            _ => continue,
+        }
+    };
+    logln!("derp: server key received");
+
+    // Authenticate. No credential crosses this link: the box is keyed by our
+    // node key, which the relay already knows from the control plane.
+    //
+    // The nonce was drawn randomly above. Deriving it from anything stable —
+    // the server key, say — would repeat it on every connection under the
+    // same node key, which is the one thing a NaCl nonce may never do.
+    let mut payload = [0u8; 256];
+    let n = client_info_payload(node_secret, node_public, &server_key, &nonce, &mut payload)
+        .map_err(|_| DerpError::Protocol)?;
+    let mut header = [0u8; HEADER_LEN];
+    write_header(&mut header, FrameType::ClientInfo, n as u32).map_err(|_| DerpError::Protocol)?;
+    tls.write_all(&header).await.map_err(|_| DerpError::Io)?;
+    tls.write_all(&payload[..n]).await.map_err(|_| DerpError::Io)?;
+    tls.flush().await.map_err(|_| DerpError::Io)?;
+
+    loop {
+        match next_frame(&mut reader, &mut staged, &mut staged_len, &mut tls).await? {
+            (FrameType::ServerInfo, mut payload, len) => {
+                open(node_secret, &server_key, &mut payload[..len])
+                    .map_err(|_| DerpError::Protocol)?;
+                logln!("derp: relay accepted us");
+                return Ok(server_key);
+            }
+            _ => continue,
+        }
+    }
+}
+
+/// Reads one complete DERP frame, refilling from TLS as needed.
+async fn next_frame<S>(
+    reader: &mut FrameReader,
+    staged: &mut [u8; 1024],
+    staged_len: &mut usize,
+    tls: &mut S,
+) -> Result<(FrameType, [u8; 512], usize), DerpError>
+where
+    S: Read,
+{
+    let mut assembled = [0u8; 512];
+    let mut filled = 0usize;
+    let mut pos = 0usize;
+    loop {
+        // Refill when the reader stops making progress, not only when the
+        // buffer is exhausted. A loop that can spin without awaiting starves
+        // every other task in a cooperative executor — the board goes silent
+        // with its USB still enumerated, which looks like a hang rather than
+        // a busy loop.
+        if pos == *staged_len {
+            let n = tls.read(staged).await.map_err(|_| DerpError::Io)?;
+            if n == 0 {
+                return Err(DerpError::Io);
+            }
+            *staged_len = n;
+            pos = 0;
+        }
+        let (used, frame) = reader
+            .feed(&staged[pos..*staged_len])
+            .map_err(|_| DerpError::Protocol)?;
+        pos += used;
+        match frame {
+            None => {
+                if used == 0 {
+                    // Needs more bytes: keep the tail and read.
+                    staged.copy_within(pos..*staged_len, 0);
+                    *staged_len -= pos;
+                    pos = 0;
+                    let n = tls
+                        .read(&mut staged[*staged_len..])
+                        .await
+                        .map_err(|_| DerpError::Io)?;
+                    if n == 0 {
+                        return Err(DerpError::Io);
+                    }
+                    *staged_len += n;
+                }
+                continue;
+            }
+            Some(Frame::Control { kind, payload }) => {
+                let src = payload.as_slice();
+                let take = src.len().min(assembled.len());
+                assembled[..take].copy_from_slice(&src[..take]);
+                // Carry the unread tail forward rather than dropping it.
+                staged.copy_within(pos..*staged_len, 0);
+                *staged_len -= pos;
+                return Ok((kind, assembled, take));
+            }
+            Some(Frame::Body { kind, chunk, end, .. }) => {
+                let take = chunk.len().min(assembled.len() - filled);
+                assembled[filled..filled + take].copy_from_slice(&chunk[..take]);
+                filled += take;
+                if end {
+                    staged.copy_within(pos..*staged_len, 0);
+                    *staged_len -= pos;
+                    return Ok((kind, assembled, filled));
+                }
+            }
+        }
+    }
+}
+
+fn build_upgrade(host: &str, out: &mut [u8]) -> usize {
+    let mut n = 0;
+    for part in [
+        b"GET " as &[u8],
+        UPGRADE_PATH.as_bytes(),
+        b" HTTP/1.1\r\nHost: ",
+        host.as_bytes(),
+        b"\r\nConnection: Upgrade\r\nUpgrade: ",
+        UPGRADE_PROTOCOL.as_bytes(),
+        b"\r\n\r\n",
+    ] {
+        out[n..n + part.len()].copy_from_slice(part);
+        n += part.len();
+    }
+    n
+}
+
+fn find_headers_end(buf: &[u8]) -> Option<usize> {
+    buf.windows(4).position(|w| w == b"\r\n\r\n").map(|i| i + 4)
+}
