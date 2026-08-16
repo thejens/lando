@@ -11,9 +11,11 @@
 //!     without reply, which is indistinguishable from a firewall drop.
 
 pub mod handshake;
+pub mod peer;
 pub mod transport;
 
 pub use handshake::{Initiation, Initiator, Responder, SessionKeys};
+pub use peer::{Action, Peer};
 pub use transport::{ReplayWindow, Session};
 
 use crate::crypto;

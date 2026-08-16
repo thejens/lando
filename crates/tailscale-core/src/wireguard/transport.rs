@@ -138,6 +138,12 @@ impl Session {
         self.local_index
     }
 
+    /// Messages sent on this key so far. Drives the message-count half of the
+    /// rekey policy, which matters on a fast link long before the time limit.
+    pub fn send_counter(&self) -> u64 {
+        self.send_counter
+    }
+
     /// True once this session has sent enough messages to require a rekey.
     pub fn needs_rekey(&self) -> bool {
         self.send_counter >= REJECT_AFTER_MESSAGES
