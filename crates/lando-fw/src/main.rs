@@ -22,6 +22,7 @@
 
 mod config;
 mod control;
+mod h2conn;
 
 use core::fmt::Write as _;
 
@@ -191,6 +192,20 @@ fn handle_command(line: &str, pending: &mut Config, store: &mut Store) {
             }
             Err(_) => logln!("password too long"),
         },
+        "host" => match String::try_from(value) {
+            Ok(v) => {
+                pending.control_host = v;
+                logln!("control host staged: {}", value);
+            }
+            Err(_) => logln!("host too long"),
+        },
+        "ckey" => match String::try_from(value) {
+            Ok(v) => {
+                pending.control_key = v;
+                logln!("control key staged ({} chars)", value.len());
+            }
+            Err(_) => logln!("control key too long"),
+        },
         "key" => match String::try_from(value) {
             Ok(v) => {
                 pending.auth_key = v;
@@ -217,10 +232,74 @@ fn handle_command(line: &str, pending: &mut Config, store: &mut Store) {
             );
         }
         "help" | "?" => {
-            logln!("ssid <v> | pass <v> | key <v> | save | clear | show | b=bootloader");
+            logln!("ssid|pass|key|host|ckey <v> | save | clear | show | b=bootloader");
         }
         other => logln!("unknown command {:?} (try ?)", other),
     }
+}
+
+/// Registers this node, returning a short status line.
+async fn register(
+    socket: &mut embassy_net::tcp::TcpSocket<'_>,
+    session: tailscale_core::noise::Session,
+    leftover: &[u8],
+    host: &str,
+    cfg: &Config,
+    node_key: &tailscale_core::key::NodePublic,
+) -> Result<String<64>, h2conn::H2Error> {
+    let mut conn = h2conn::H2Conn::start(socket, session, leftover).await?;
+
+    let hostinfo = tailscale_core::control::Hostinfo {
+        hostname: "lando-pico",
+        ..Default::default()
+    };
+    let auth = if cfg.auth_key.is_empty() {
+        None
+    } else {
+        Some(cfg.auth_key.as_str())
+    };
+
+    let mut body = [0u8; 640];
+    let n = tailscale_core::control::write_register_request(
+        &mut body,
+        &tailscale_core::control::Register {
+            capability_version: tailscale_core::CAPABILITY_VERSION,
+            node_key,
+            auth_key: auth,
+            followup: None,
+            hostinfo: &hostinfo,
+            ephemeral: false,
+        },
+    )
+    .map_err(|_| h2conn::H2Error::Frame)?;
+
+    let mut out = [0u8; 1024];
+    let len = conn
+        .post(
+            socket,
+            host,
+            tailscale_core::control::REGISTER_PATH,
+            &body[..n],
+            &mut out,
+        )
+        .await?;
+
+    let mut status: String<64> = String::new();
+    match tailscale_core::control::parse_register_response(&out[..len]) {
+        Ok(r) if !r.error.is_empty() => {
+            let _ = core::write!(&mut status, "refused: {}", r.error);
+        }
+        Ok(r) if !r.auth_url.is_empty() => {
+            let _ = core::write!(&mut status, "needs interactive login");
+        }
+        Ok(r) => {
+            let _ = core::write!(&mut status, "registered, authorized={}", r.machine_authorized);
+        }
+        Err(_) => {
+            let _ = core::write!(&mut status, "bad response ({} bytes)", len);
+        }
+    }
+    Ok(status)
 }
 
 #[embassy_executor::main]
@@ -229,7 +308,21 @@ async fn main(spawner: Spawner) {
     let driver = Driver::new(p.USB, Irqs);
 
     let mut store = Store::new(p.FLASH);
-    let stored = store.load();
+    let mut stored = store.load();
+
+    // Keys are generated once and kept. This has to happen before the console
+    // task takes the store, and before anything tries to register.
+    let mut trng = Trng::new(p.TRNG, Irqs, Default::default());
+    if let Some(cfg) = stored.as_mut() {
+        if cfg.machine_key.is_none() || cfg.node_key.is_none() {
+            let mut k = [0u8; 32];
+            rand_core::RngCore::fill_bytes(&mut trng, &mut k);
+            cfg.machine_key = Some(k);
+            rand_core::RngCore::fill_bytes(&mut trng, &mut k);
+            cfg.node_key = Some(k);
+            let _ = store.save(cfg);
+        }
+    }
 
     let mut config = UsbConfig::new(0xc0de, 0xcafe);
     config.manufacturer = Some("lando");
@@ -329,7 +422,7 @@ async fn main(spawner: Spawner) {
         .set_power_management(cyw43::PowerManagementMode::None)
         .await;
 
-    let Some(cfg) = stored.filter(Config::is_complete) else {
+    let Some(cfg) = stored.clone().filter(Config::is_complete) else {
         logln!("unprovisioned — set credentials over this console, then reboot");
         logln!("  ssid <name>");
         logln!("  pass <passphrase>");
@@ -363,10 +456,9 @@ async fn main(spawner: Spawner) {
     logln!("radio: {}", status);
 
     // ---- network stack ----
-    // Seed from the RP2350's hardware TRNG rather than a constant: it seeds
-    // TCP initial sequence numbers, and a device that boots with the same
-    // seed every time is trivially predictable.
-    let mut trng = Trng::new(p.TRNG, Irqs, Default::default());
+    // Seeded from the hardware TRNG initialised at boot: this seeds TCP
+    // initial sequence numbers, and a device that boots with the same seed
+    // every time is trivially predictable.
     let seed = rand_core::RngCore::next_u64(&mut trng);
 
     static RESOURCES: StaticCell<embassy_net::StackResources<4>> = StaticCell::new();
@@ -392,27 +484,43 @@ async fn main(spawner: Spawner) {
     );
 
     // ---- control plane ----
-    // Keys from the hardware TRNG. These are ephemeral for now: a real
-    // registration must persist the machine and node keys to flash, or every
-    // reboot creates a new node and burns an auth-key use.
-    let mut key_bytes = [0u8; 32];
-    rand_core::RngCore::fill_bytes(&mut trng, &mut key_bytes);
-    let machine_key = tailscale_core::key::MachinePrivate::from_bytes(key_bytes);
-    rand_core::RngCore::fill_bytes(&mut trng, &mut key_bytes);
-    let ephemeral = tailscale_core::key::MachinePrivate::from_bytes(key_bytes);
+    let cfg = cfg.clone();
+    let host_spec = if cfg.control_host.is_empty() {
+        tailscale_core::DEFAULT_CONTROL_HOST
+    } else {
+        cfg.control_host.as_str()
+    };
+    let (host, port) = match host_spec.split_once(':') {
+        Some((h, p)) => (h, p.parse::<u16>().unwrap_or(80)),
+        None => (host_spec, 80),
+    };
+    let key_str = if cfg.control_key.is_empty() {
+        CONTROL_KEY
+    } else {
+        cfg.control_key.as_str()
+    };
 
     let mut control_status: String<64> = String::new();
-    match tailscale_core::key::MachinePublic::parse(CONTROL_KEY) {
-        Err(_) => {
-            let _ = core::write!(&mut control_status, "bad pinned key");
-        }
-        Ok(control_key) => {
+    let machine_key = cfg.machine_key.map(tailscale_core::key::MachinePrivate::from_bytes);
+    let node_key = cfg.node_key.map(tailscale_core::key::NodePrivate::from_bytes);
+
+    match (
+        tailscale_core::key::MachinePublic::parse(key_str),
+        machine_key,
+        node_key,
+    ) {
+        (Ok(control_key), Some(machine_key), Some(node_key)) => {
+            let mut seed = [0u8; 32];
+            rand_core::RngCore::fill_bytes(&mut trng, &mut seed);
+            let ephemeral = tailscale_core::key::MachinePrivate::from_bytes(seed);
+
             static RX: StaticCell<[u8; 4096]> = StaticCell::new();
             static TX: StaticCell<[u8; 2048]> = StaticCell::new();
             let started = embassy_time::Instant::now();
             match control::connect(
                 stack,
-                tailscale_core::DEFAULT_CONTROL_HOST,
+                host,
+                port,
                 &control_key,
                 machine_key,
                 ephemeral,
@@ -422,22 +530,36 @@ async fn main(spawner: Spawner) {
             )
             .await
             {
-                Ok((_socket, session)) => {
-                    let bind = session.handshake_hash();
-                    let _ = core::write!(
-                        &mut control_status,
-                        "ts2021 up in {} ms, bind {:02x}{:02x}{:02x}{:02x}",
-                        started.elapsed().as_millis(),
-                        bind[0],
-                        bind[1],
-                        bind[2],
-                        bind[3]
-                    );
-                }
                 Err(e) => {
                     let _ = core::write!(&mut control_status, "ts2021 failed: {:?}", e);
                 }
+                Ok((mut socket, session, leftover, leftover_len)) => {
+                    logln!("control: ts2021 up in {} ms", started.elapsed().as_millis());
+                    match register(
+                        &mut socket,
+                        session,
+                        &leftover[..leftover_len],
+                        host,
+                        &cfg,
+                        &node_key.public(),
+                    )
+                    .await
+                    {
+                        Ok(text) => {
+                            let _ = core::write!(&mut control_status, "{}", text.as_str());
+                        }
+                        Err(e) => {
+                            let _ = core::write!(&mut control_status, "register failed: {:?}", e);
+                        }
+                    }
+                }
             }
+        }
+        (Err(_), _, _) => {
+            let _ = core::write!(&mut control_status, "bad control key");
+        }
+        _ => {
+            let _ = core::write!(&mut control_status, "no device keys");
         }
     }
     logln!("control: {}", control_status.as_str());

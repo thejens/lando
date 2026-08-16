@@ -43,24 +43,33 @@ pub enum ControlError {
 pub async fn connect<'a>(
     stack: Stack<'static>,
     host: &str,
+    port: u16,
     control_key: &MachinePublic,
     machine_key: MachinePrivate,
     ephemeral: MachinePrivate,
     capability_version: u16,
     rx_buf: &'a mut [u8; RX],
     tx_buf: &'a mut [u8; TX],
-) -> Result<(TcpSocket<'a>, Session), ControlError> {
-    let addrs = stack
-        .dns_query(host, DnsQueryType::A)
-        .await
-        .map_err(|_| ControlError::Dns)?;
-    let addr = *addrs.first().ok_or(ControlError::Dns)?;
-    logln!("control: {} resolves to {}", host, addr);
+) -> Result<(TcpSocket<'a>, Session, [u8; 512], usize), ControlError> {
+    // A self-hosted control server is usually reached by address, and DNS
+    // would simply fail on a literal.
+    let addr = match parse_ipv4(host) {
+        Some(ip) => ip,
+        None => {
+            let addrs = stack
+                .dns_query(host, DnsQueryType::A)
+                .await
+                .map_err(|_| ControlError::Dns)?;
+            let addr = *addrs.first().ok_or(ControlError::Dns)?;
+            logln!("control: {} resolves to {}", host, addr);
+            addr
+        }
+    };
 
     let mut socket = TcpSocket::new(stack, rx_buf, tx_buf);
     socket.set_timeout(Some(Duration::from_secs(20)));
     socket
-        .connect((addr, 80))
+        .connect((addr, port))
         .await
         .map_err(|_| ControlError::Connect)?;
 
@@ -117,5 +126,29 @@ pub async fn connect<'a>(
     let session = handshake
         .finish(&buf[body_start..body_start + RESPONSE_LEN])
         .map_err(|_| ControlError::Handshake)?;
-    Ok((socket, session))
+
+    // Anything past the handshake response is already session data -- the
+    // server coalesces its first records into the same segment. Dropping it
+    // leaves the next read starting mid-record, which fails to decrypt and
+    // looks like a key problem rather than a framing one.
+    let start = body_start + RESPONSE_LEN;
+    let leftover_len = have - start;
+    let mut leftover = [0u8; 512];
+    leftover[..leftover_len].copy_from_slice(&buf[start..have]);
+    Ok((socket, session, leftover, leftover_len))
+}
+
+/// Parses a dotted-quad, so a literal address bypasses DNS entirely.
+fn parse_ipv4(host: &str) -> Option<embassy_net::IpAddress> {
+    let mut octets = [0u8; 4];
+    let mut parts = host.split('.');
+    for slot in octets.iter_mut() {
+        *slot = parts.next()?.parse().ok()?;
+    }
+    if parts.next().is_some() {
+        return None;
+    }
+    Some(embassy_net::IpAddress::v4(
+        octets[0], octets[1], octets[2], octets[3],
+    ))
 }

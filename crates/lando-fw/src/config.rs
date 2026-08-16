@@ -24,7 +24,7 @@ pub const FLASH_SIZE: usize = 4 * 1024 * 1024;
 pub const CONFIG_OFFSET: u32 = (FLASH_SIZE - ERASE_SIZE) as u32;
 
 const MAGIC: &[u8; 8] = b"LANDOCFG";
-const VERSION: u8 = 2;
+const VERSION: u8 = 3;
 pub const MAX_FIELD: usize = 96;
 
 /// What the device needs to reach the tailnet, none of which belongs in the
@@ -36,6 +36,12 @@ pub struct Config {
     /// Tailnet pre-auth key. Only needed for the first registration; after
     /// that the node key in this sector is what identifies the device.
     pub auth_key: String<MAX_FIELD>,
+    /// Control server hostname. Empty means Tailscale's hosted plane.
+    pub control_host: String<MAX_FIELD>,
+    /// The control server's Noise static, `mkey:...`. Empty means the pinned
+    /// default, which is only correct for the hosted plane -- a self-hosted
+    /// server has its own key and will fail to decrypt without it.
+    pub control_key: String<MAX_FIELD>,
     /// Noise static identifying this device to the control plane.
     pub machine_key: Option<[u8; 32]>,
     /// WireGuard static identifying this node within the tailnet.
@@ -85,6 +91,8 @@ impl Store {
         let ssid = read_field()?;
         let password = read_field()?;
         let auth_key = read_field().unwrap_or_default();
+        let control_host = read_field().unwrap_or_default();
+        let control_key = read_field().unwrap_or_default();
 
         // Keys are optional so a config written before the device had any
         // still loads; they are generated and saved on first registration.
@@ -104,6 +112,8 @@ impl Store {
             ssid,
             password,
             auth_key,
+            control_host,
+            control_key,
             machine_key: read_key(),
             node_key: read_key(),
         })
@@ -119,7 +129,13 @@ impl Store {
         buf[..8].copy_from_slice(MAGIC);
         buf[8] = VERSION;
         let mut pos = 9;
-        for field in [&config.ssid, &config.password, &config.auth_key] {
+        for field in [
+            &config.ssid,
+            &config.password,
+            &config.auth_key,
+            &config.control_host,
+            &config.control_key,
+        ] {
             let bytes = field.as_bytes();
             buf[pos] = bytes.len() as u8;
             buf[pos + 1..pos + 1 + bytes.len()].copy_from_slice(bytes);
