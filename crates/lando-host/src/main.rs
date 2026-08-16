@@ -252,7 +252,7 @@ fn control_plane(peers_out: Option<node::PeerSet>, home_derp: u32) -> Result<(),
     println!();
     println!("map          : POST {MAP_PATH} (streaming, uncompressed)");
     conn.set_read_timeout(MAP_POLL_TIMEOUT)?;
-    poll_netmap(&mut conn, &host, &node_key, &state.disco_key.public(), &hostinfo, peers_out, home_derp)
+    poll_netmap(&mut conn, &host, &node_key, &state.disco_key.public(), &hostinfo, peers_out)
 }
 
 /// Streams the netmap until the connection drops or the process is killed.
@@ -263,7 +263,6 @@ fn poll_netmap(
     disco_key: &tailscale_core::key::DiscoPublic,
     hostinfo: &Hostinfo,
     peers_out: Option<node::PeerSet>,
-    home_derp: u32,
 ) -> Result<(), String> {
     let mut buf = vec![0u8; 4096];
     let n = write_map_request(
