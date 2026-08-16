@@ -934,12 +934,12 @@ async fn main(spawner: Spawner) {
                                     // ours; every other address it answers for
                                     // belongs to the LAN and is reached by
                                     // opening a second connection to it.
-                                    static TUNNEL_STORAGE: StaticCell<tunnel::Storage> =
-                                        StaticCell::new();
+                                    // Taken once, here. The storage is far too
+                                    // large to build on the stack and move
+                                    // into place, so it is laid out statically
+                                    // and handed over by reference.
                                     let tunnel = TunnelShared::new(core::cell::RefCell::new(
-                                        tunnel::Tunnel::new(
-                                            TUNNEL_STORAGE.init(tunnel::Storage::new()),
-                                        ),
+                                        tunnel::Tunnel::new(unsafe { tunnel::storage() }),
                                     ));
                                     // Both halves block forever by design: the
                                     // poll is what keeps the node online, the

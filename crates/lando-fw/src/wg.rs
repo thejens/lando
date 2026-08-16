@@ -263,7 +263,11 @@ pub async fn serve(stack: Stack<'static>, node: &Shared, tunnel: &crate::TunnelS
 /// by its own task: it has to keep reading frames while this side is writing,
 /// and sharing the TLS connection between them would mean interleaving reads
 /// and writes on one buffer.
-pub static DERP_OUT: embassy_sync::channel::Channel<CriticalSectionRawMutex, Relayed, 4> =
+///
+/// Eight slots, which is enough that a full channel is not what limits a
+/// transfer: measured, going from four to sixteen changed a relayed download
+/// by under 3%, so the queue is not the constraint the send window is.
+pub static DERP_OUT: embassy_sync::channel::Channel<CriticalSectionRawMutex, Relayed, 8> =
     embassy_sync::channel::Channel::new();
 
 /// One packet on its way to the relay.

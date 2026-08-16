@@ -51,21 +51,27 @@ use crate::logln;
 /// weighted by how a client actually uses them — a browser opens many
 /// connections to 80 and 443, while a control protocol on 37193 is mostly
 /// sequential but should not fail a burst either.
-pub const PORTS: [u16; 28] = [
-    80, 80, 80, 80, 80, 80, 80, 80, 80, 80, //
-    443, 443, 443, 443, 443, 443, 443, 443, //
-    1400, 1400, 1400, 1400, //
-    37193, 37193, 37193, 37193, 37193, 37193,
+pub const PORTS: [u16; 18] = [
+    80, 80, 80, 80, 80, 80, 80, 80, //
+    443, 443, 443, 443, //
+    1400, 1400, //
+    37193, 37193, 37193, 37193,
 ];
 
-/// Per-socket buffers.
+/// Per-socket buffers, sized by round-trip rather than by message size.
 ///
-/// Deliberately small, and traded against listener count: every byte here is
-/// multiplied by [`PORTS`], and a refused connection costs a whole resource
-/// where a small window only costs throughput. This device forwards control
-/// traffic, not bulk transfers.
-const TCP_RX: usize = 768;
-const TCP_TX: usize = 768;
+/// The send buffer is the TCP window, and over a relay the round-trip is
+/// around 80 ms — so a peer can be sent at most one buffer's worth per 80 ms
+/// no matter how fast either end is. At 768 bytes that is 9 KB/s, which turned
+/// a 170 KB script into a 24-second download and, in a browser, into a failed
+/// page. The buffers are therefore asymmetric: requests arriving from a peer
+/// are small, responses going back are not.
+///
+/// This is the one number to raise if relayed transfers feel slow, and the
+/// reason the storage is placed statically — at this size it can no longer be
+/// built on the stack.
+const TCP_RX: usize = 1024;
+const TCP_TX: usize = 8192;
 
 /// Largest IP packet either side will carry.
 const MTU: usize = 1400;
@@ -155,6 +161,11 @@ impl Device for TunnelDevice {
 }
 
 /// Storage for the socket set, which smoltcp requires to outlive the interface.
+///
+/// Reached through [`storage`] rather than constructed by a caller: at this
+/// size the value cannot be built on the stack and moved into place, which is
+/// what a `StaticCell` would require. The symptom of trying is not a compile
+/// error but a device that stops partway through boot.
 pub struct Storage {
     sockets: [SocketStorage<'static>; PORTS.len()],
     rx: [[u8; TCP_RX]; PORTS.len()],
@@ -162,13 +173,28 @@ pub struct Storage {
 }
 
 impl Storage {
-    pub const fn new() -> Self {
+    const fn new() -> Self {
         Self {
             sockets: [SocketStorage::EMPTY; PORTS.len()],
             rx: [[0; TCP_RX]; PORTS.len()],
             tx: [[0; TCP_TX]; PORTS.len()],
         }
     }
+}
+
+/// The one instance, placed by the linker rather than copied into place.
+///
+/// A `const` initialiser means it is laid out in `.bss` directly, so nothing
+/// this large ever transits the stack.
+static mut STORAGE: Storage = Storage::new();
+
+/// Hands out the socket storage. Calling this twice would alias it, so the
+/// tunnel takes it once at startup and nothing else may.
+///
+/// # Safety
+/// Must be called exactly once.
+pub unsafe fn storage() -> &'static mut Storage {
+    unsafe { &mut *core::ptr::addr_of_mut!(STORAGE) }
 }
 
 pub struct Tunnel {
@@ -435,13 +461,14 @@ async fn splice(
     let why = relay(tunnel, handle, &mut lan).await;
     logln!("tunnel: {}:{} ended ({})", dst, port, why);
 
-    // Release the socket rather than letting it wind down on its own. A
-    // gracefully closed socket sits in TIME_WAIT and its slot in the stack's
-    // pool is unavailable until that expires, so a run of requests drains the
-    // pool and later connections are silently never accepted. Flushing first
-    // means nothing already written is discarded by the reset.
+    // Close gracefully rather than resetting. A reset frees the socket's slot
+    // in the stack pool immediately, which is tempting, but a stream of RSTs
+    // from one address is exactly what consumer routers throttle — and this
+    // device makes every LAN connection from the same address, so it is the
+    // one client most likely to trip that. The pool is sized to absorb the
+    // TIME_WAIT that politeness costs.
     let _ = embedded_io_async::Write::flush(&mut lan).await;
-    lan.abort();
+    lan.close();
 }
 
 /// Copies bytes in both directions until either side finishes.
@@ -450,16 +477,22 @@ async fn relay(
     handle: SocketHandle,
     lan: &mut TcpSocket<'_>,
 ) -> &'static str {
-    let mut buf = [0u8; 512];
+    let mut buf = [0u8; 1024];
     // Bytes read from the LAN that the tailnet socket has not accepted yet.
     // A short write is ordinary flow control — the peer's window is simply
     // full — so the remainder is held and retried. Treating it as an error
     // truncates the response instead, which looks like the LAN host closing
     // the connection early.
-    let mut held = [0u8; 512];
+    let mut held = [0u8; 2048];
     // A backstop against any path that leaks a worker: no bytes either way for
     // this long and the connection is over, whatever either side believes.
     let mut last_activity = Instant::now();
+    // A LAN host that accepts a connection and then never answers is treated
+    // far more harshly than an idle one. Holding a worker for the full idle
+    // timeout on a host that is not going to reply starves the pool, and takes
+    // down unrelated requests that would have succeeded — one unresponsive
+    // host should cost one connection, not all of them.
+    let mut heard_from_lan = false;
     // Indices rather than a slice: the same buffer is read into again once
     // drained, which a borrow of it would forbid.
     let mut pending = 0usize..0usize;
@@ -502,7 +535,11 @@ async fn relay(
                 return "lan write failed";
             }
         }
-        if Instant::now() - last_activity > Duration::from_secs(20) {
+        let waited = Instant::now() - last_activity;
+        if !heard_from_lan && waited > Duration::from_secs(6) {
+            return "lan silent";
+        }
+        if waited > Duration::from_secs(20) {
             return "idle";
         }
 
@@ -551,6 +588,7 @@ async fn relay(
                 }
                 Ok(n) => {
                     last_activity = Instant::now();
+                    heard_from_lan = true;
                     pending = 0..n;
                 }
             }
