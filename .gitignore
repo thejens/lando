@@ -8,3 +8,11 @@
 
 # Firmware build output (its own workspace, so its own target dir).
 /crates/lando-fw/target
+
+# WiFi credentials for firmware provisioning.
+.lando-wifi
+
+# CYW43 radio firmware blobs. Redistributable under their own permissive
+# binary licence, not this repo's MIT — fetched by `make cyw43-firmware`
+# rather than vendored, so the licences stay separate.
+/crates/lando-fw/cyw43-firmware

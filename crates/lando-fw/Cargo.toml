@@ -24,6 +24,10 @@ cortex-m-rt = "0.7"
 panic-halt = "1"
 log = "0.4"
 static_cell = "2"
+cyw43 = { version = "0.7.0", features = ["firmware-logs"] }
+cyw43-pio = "0.10.0"
+embassy-net = { version = "0.9.1", features = ["tcp", "dhcpv4", "medium-ip", "proto-ipv4"] }
+rand_core = { version = "0.6", default-features = false }
 
 [profile.release]
 opt-level = "z"

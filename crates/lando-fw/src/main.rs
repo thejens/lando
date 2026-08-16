@@ -6,8 +6,11 @@
 //! scheduling that ties them together.
 //!
 //! There is no debug probe on this board, so USB CDC is the only way anything
-//! gets out. The logger runs as its own task, independent of the network
-//! tasks, so a wedged network stack still talks.
+//! gets out — which makes the order of operations at boot matter more than it
+//! looks. `panic_halt` turns any panic or stack overflow into a silent spin
+//! that stops the executor, USB task included, leaving the device stuck
+//! half-enumerated with no way to say why. So nothing heavy runs before USB is
+//! up and has had a chance to say something.
 
 #![no_std]
 #![no_main]
@@ -32,7 +35,7 @@ static IMAGE_DEF: embassy_rp::block::ImageDef = embassy_rp::block::ImageDef::sec
 
 #[embassy_executor::task]
 async fn logger_task(driver: Driver<'static, USB>) {
-    embassy_usb_logger::run!(1024, log::LevelFilter::Info, driver);
+    embassy_usb_logger::run!(4096, log::LevelFilter::Info, driver);
 }
 
 #[embassy_executor::main]
@@ -42,39 +45,17 @@ async fn main(spawner: Spawner) {
     let driver = Driver::new(p.USB, Irqs);
     spawner.spawn(logger_task(driver)).unwrap();
 
-    // The host takes a moment to enumerate the CDC device; anything logged
-    // before that is written into the void.
-    Timer::after(Duration::from_secs(2)).await;
-
-    log::info!("lando-fw starting on RP2350");
-    log::info!("capability version {}", tailscale_core::CAPABILITY_VERSION);
-    log::info!("control host {}", tailscale_core::DEFAULT_CONTROL_HOST);
-
-    // Proves the protocol core links and runs on the target, not just that the
-    // firmware boots: this is the same code the host binary uses to talk to
-    // the control plane.
-    let machine = tailscale_core::key::MachinePrivate::from_bytes([7u8; 32]);
-    let control = tailscale_core::key::MachinePublic::parse(
-        "mkey:7d2792f9c98d753d2042471536801949104c247f95eac770f8fb321595e2173b",
-    )
-    .unwrap();
-    let ephemeral = tailscale_core::key::MachinePrivate::from_bytes([9u8; 32]);
-    let (_, initiation) = tailscale_core::noise::Handshake::start(
-        machine,
-        &control,
-        tailscale_core::CAPABILITY_VERSION,
-        ephemeral,
-    );
-    log::info!(
-        "noise initiation built: {} bytes, type {}",
-        initiation.len(),
-        initiation[2]
-    );
+    // Enumeration has to finish before anything else is attempted, and the
+    // host needs a moment after that before it will read what we write.
+    Timer::after(Duration::from_secs(3)).await;
 
     let mut ticks = 0u32;
     loop {
-        log::info!("alive, tick {ticks}");
+        log::info!(
+            "lando-fw alive on RP2350 — tick {ticks}, capver {}",
+            tailscale_core::CAPABILITY_VERSION
+        );
         ticks = ticks.wrapping_add(1);
-        Timer::after(Duration::from_secs(5)).await;
+        Timer::after(Duration::from_secs(2)).await;
     }
 }
