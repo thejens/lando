@@ -77,6 +77,7 @@ where
     let mut nonce = [0u8; NONCE_LEN];
     rng.fill_bytes(&mut nonce);
 
+    logln!("derp: resolving {}", host);
     let addrs = stack
         .dns_query(host, DnsQueryType::A)
         .await

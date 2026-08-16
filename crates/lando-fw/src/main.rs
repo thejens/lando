@@ -69,6 +69,10 @@ static IMAGE_DEF: embassy_rp::block::ImageDef = embassy_rp::block::ImageDef::sec
 const CONTROL_KEY: &str =
     "mkey:7d2792f9c98d753d2042471536801949104c247f95eac770f8fb321595e2173b";
 
+/// Set by the console's `derp` command.
+static DERP_ENABLED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
 const LINE_LEN: usize = 128;
 /// Log lines waiting to go out. Bounded, and full means drop: a device whose
 /// network stack stalls because its logging backed up is worse than one that
@@ -101,6 +105,15 @@ async fn net_task(
     mut runner: embassy_net::Runner<'static, cyw43::NetDriver<'static>>,
 ) -> ! {
     runner.run().await
+}
+
+#[embassy_executor::task]
+async fn watchdog_task(mut watchdog: embassy_rp::watchdog::Watchdog) -> ! {
+    loop {
+        // The period is re-armed on each feed on this part.
+        watchdog.feed(Duration::from_secs(8));
+        Timer::after(Duration::from_secs(2)).await;
+    }
 }
 
 #[embassy_executor::task]
@@ -215,6 +228,10 @@ fn handle_command(line: &str, pending: &mut Config, store: &mut Store) {
             }
             Err(_) => logln!("auth key too long"),
         },
+        "derp" => {
+            DERP_ENABLED.store(true, core::sync::atomic::Ordering::Relaxed);
+            logln!("derp: enabled; reboot to attempt a relay connection");
+        }
         "save" => match store.save(pending) {
             Ok(()) => logln!("saved to flash; reboot to apply"),
             Err(()) => logln!("flash write failed"),
@@ -234,7 +251,7 @@ fn handle_command(line: &str, pending: &mut Config, store: &mut Store) {
             );
         }
         "help" | "?" => {
-            logln!("ssid|pass|key|host|ckey <v> | save | clear | show | b=bootloader");
+            logln!("ssid|pass|key|host|ckey <v> | save | clear | show | derp | b=bootloader");
         }
         other => logln!("unknown command {:?} (try ?)", other),
     }
@@ -373,6 +390,13 @@ async fn main(spawner: Spawner) {
     let p = embassy_rp::init(Default::default());
     let driver = Driver::new(p.USB, Irqs);
 
+    // A starved executor previously meant someone had to hold BOOTSEL to
+    // recover the board. The watchdog is fed by a task, so anything that stops
+    // tasks running reboots the device instead of bricking it until a human
+    // arrives.
+    let mut watchdog = embassy_rp::watchdog::Watchdog::new(p.WATCHDOG);
+    watchdog.start(embassy_time::Duration::from_secs(8));
+
     let mut store = Store::new(p.FLASH);
     let mut stored = store.load();
 
@@ -417,6 +441,7 @@ async fn main(spawner: Spawner) {
     let class = CdcAcmClass::new(&mut builder, CDC_STATE.init(State::new()), 64);
     let usb = builder.build();
 
+    spawner.spawn(watchdog_task(watchdog)).unwrap();
     spawner.spawn(usb_task(usb)).unwrap();
     spawner.spawn(console_task(class, store)).unwrap();
 
@@ -651,7 +676,16 @@ async fn main(spawner: Spawner) {
                                         StaticCell::new();
                                     static DERP_RX: StaticCell<[u8; 2048]> = StaticCell::new();
                                     static DERP_TX: StaticCell<[u8; 2048]> = StaticCell::new();
+                                    // Opt-in rather than automatic. DERP is
+                                    // the least-proven path here, and running
+                                    // it at boot means a fault in it takes the
+                                    // whole device down before the console can
+                                    // be used to recover.
                                     let relay = async {
+                                        if !DERP_ENABLED.load(core::sync::atomic::Ordering::Relaxed)
+                                        {
+                                            core::future::pending::<()>().await;
+                                        }
                                         match derp::connect(
                                             stack,
                                             "derp1i.tailscale.com",
