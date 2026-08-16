@@ -10,7 +10,7 @@
 //! its Huffman tables and its dynamic-table state off the device entirely.
 
 use embassy_net::tcp::TcpSocket;
-use embedded_io_async::{Read, Write};
+use embedded_io_async::Write;
 
 use tailscale_core::control::{parse_early_payload, EarlyPayload};
 use tailscale_core::h2::{self, FrameReader, Item};
@@ -345,14 +345,3 @@ impl H2Conn {
     }
 }
 
-async fn read_exact(socket: &mut TcpSocket<'_>, buf: &mut [u8]) -> Result<(), H2Error> {
-    let mut have = 0;
-    while have < buf.len() {
-        let n = socket.read(&mut buf[have..]).await.map_err(|_| H2Error::Io)?;
-        if n == 0 {
-            return Err(H2Error::Io);
-        }
-        have += n;
-    }
-    Ok(())
-}

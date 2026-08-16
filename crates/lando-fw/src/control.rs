@@ -13,7 +13,7 @@ use embassy_net::dns::DnsQueryType;
 use embassy_net::tcp::TcpSocket;
 use embassy_net::Stack;
 use embassy_time::Duration;
-use embedded_io_async::{Read, Write};
+use embedded_io_async::Write;
 
 use tailscale_core::key::{MachinePrivate, MachinePublic};
 use tailscale_core::noise::{Handshake, Session, HEADER_LEN, MSG_TYPE_ERROR, RESPONSE_LEN};

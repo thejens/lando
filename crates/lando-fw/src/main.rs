@@ -69,6 +69,13 @@ static IMAGE_DEF: embassy_rp::block::ImageDef = embassy_rp::block::ImageDef::sec
 const CONTROL_KEY: &str =
     "mkey:7d2792f9c98d753d2042471536801949104c247f95eac770f8fb321595e2173b";
 
+/// Relay region this node homes on.
+///
+/// Stated rather than chosen: picking one needs latency probes across the
+/// whole relay map, and a fixed nearby region costs a few milliseconds
+/// against a measurable amount of flash and airtime.
+const DERP_REGION: u32 = 1;
+
 /// Set by the console's `derp` command.
 static DERP_ENABLED: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
@@ -257,6 +264,75 @@ fn handle_command(line: &str, pending: &mut Config, store: &mut Store) {
     }
 }
 
+/// Everything this device tells the control plane about itself.
+///
+/// Built in one place because the control plane stores whatever arrives most
+/// recently: two call sites that disagree would leave the node describing
+/// itself differently depending on which request landed last.
+fn hostinfo<'a>(routes: &'a [&'a str], preferred_derp: u32) -> tailscale_core::control::Hostinfo<'a> {
+    tailscale_core::control::Hostinfo {
+        hostname: "lando-pico",
+        // Advertised so the tailnet can route the whole LAN here rather than
+        // through a per-port forward table. Routes still have to be approved
+        // in the admin console before the control plane hands them to peers.
+        routable_ips: routes,
+        preferred_derp,
+        // Reported rather than measured. The device has no latency probe, and
+        // an absent NetInfo is treated as "nothing known" — which leaves the
+        // node with no relay at all, so a stated value is better than silence.
+        derp_latency_ms: Some(50),
+        working_udp: true,
+        ..Default::default()
+    }
+}
+
+/// Tells the control plane where this node can be reached.
+///
+/// This must be a *one-shot* request. A streaming map request is read-only —
+/// the server discards `Hostinfo` and `Endpoints` on it — so the long poll
+/// cannot carry any of this, and a device that only ever long-polls appears
+/// in the admin console with no endpoints, no relay and no connectivity data
+/// while still showing as connected.
+///
+/// `OmitPeers` with `Stream` false is upstream's designated channel for
+/// exactly this: it updates endpoints without disturbing an existing poll.
+async fn advertise(
+    conn: &mut h2conn::H2Conn,
+    socket: &mut embassy_net::tcp::TcpSocket<'_>,
+    host: &str,
+    node_key: &tailscale_core::key::NodePublic,
+    disco_key: &tailscale_core::key::DiscoPublic,
+    endpoint: &str,
+    routes: &[&str],
+) -> Result<(), h2conn::H2Error> {
+    let hostinfo = hostinfo(routes, DERP_REGION);
+    let mut body = [0u8; 768];
+    let n = tailscale_core::control::write_map_request(
+        &mut body,
+        &tailscale_core::control::MapRequest {
+            capability_version: tailscale_core::CAPABILITY_VERSION,
+            node_key,
+            disco_key,
+            hostinfo: &hostinfo,
+            stream: false,
+            keep_alive: false,
+            omit_peers: true,
+            endpoints: &[endpoint],
+            endpoint_types: &[tailscale_core::control::endpoint_type::LOCAL],
+        },
+    )
+    .map_err(|_| h2conn::H2Error::Frame)?;
+
+    // The response body carries nothing we need: with OmitPeers the server is
+    // free to send none at all, and the status code is the whole answer.
+    let mut out = [0u8; 256];
+    let len = conn
+        .post(socket, host, tailscale_core::control::MAP_PATH, &body[..n], &mut out)
+        .await?;
+    logln!("advertise: {} via derp{} ({} b reply)", endpoint, DERP_REGION, len);
+    Ok(())
+}
+
 /// Registers this node, returning a short status line.
 async fn register(
     conn: &mut h2conn::H2Conn,
@@ -264,11 +340,9 @@ async fn register(
     host: &str,
     cfg: &Config,
     node_key: &tailscale_core::key::NodePublic,
+    routes: &[&str],
 ) -> Result<String<64>, h2conn::H2Error> {
-    let hostinfo = tailscale_core::control::Hostinfo {
-        hostname: "lando-pico",
-        ..Default::default()
-    };
+    let hostinfo = hostinfo(routes, DERP_REGION);
     let auth = if cfg.auth_key.is_empty() {
         None
     } else {
@@ -357,7 +431,6 @@ async fn map_poll(
     host: &str,
     node_key: &tailscale_core::key::NodePublic,
     disco_key: &tailscale_core::key::DiscoPublic,
-    endpoint: &str,
 ) -> Result<(), h2conn::H2Error> {
     let hostinfo = tailscale_core::control::Hostinfo {
         hostname: "lando-pico",
@@ -377,9 +450,12 @@ async fn map_poll(
             // Peers are dropped for now: the netmap is the largest thing that
             // arrives here, and nothing on the device consumes peers yet.
             omit_peers: true,
-            endpoints: &[endpoint],
-            endpoint_types: &[tailscale_core::control::endpoint_type::LOCAL],
-            home_derp: 0,
+            // Empty on purpose. A streaming request is read-only: the server
+            // discards Hostinfo and Endpoints on it, which is why everything
+            // this device said about itself here was silently thrown away.
+            // Advertising happens on a separate one-shot request.
+            endpoints: &[],
+            endpoint_types: &[],
         },
     )
     .map_err(|_| h2conn::H2Error::Frame)?;
@@ -618,11 +694,16 @@ async fn main(spawner: Spawner) {
     stack.wait_config_up().await;
     let mut addr: String<64> = String::new();
     let mut endpoint: String<32> = String::new();
+    let mut subnet: String<24> = String::new();
     if let Some(v4) = stack.config_v4() {
         let _ = core::write!(&mut addr, "{}", v4.address);
         // Advertised so peers can reach us directly. On a LAN this removes
         // the relay from the path entirely.
         let _ = core::write!(&mut endpoint, "{}:{}", v4.address.address(), wg::PORT);
+        // The subnet this device can route into, taken from DHCP so moving the
+        // board to another network needs no reconfiguration.
+        let net = v4.address.network();
+        let _ = core::write!(&mut subnet, "{}/{}", net.address(), net.prefix_len());
     }
     logln!(
         "net: DHCP up in {} ms, address {}",
@@ -689,8 +770,18 @@ async fn main(spawner: Spawner) {
                             let _ = core::write!(&mut control_status, "h2 failed: {:?}", e);
                         }
                         Ok(mut conn) => {
-                            match register(&mut conn, &mut socket, host, &cfg, &node_key.public())
-                                .await
+                            let routes: [&str; 1] = [subnet.as_str()];
+                            let routes: &[&str] =
+                                if subnet.is_empty() { &[] } else { &routes };
+                            match register(
+                                &mut conn,
+                                &mut socket,
+                                host,
+                                &cfg,
+                                &node_key.public(),
+                                routes,
+                            )
+                            .await
                             {
                                 Err(e) => {
                                     let _ =
@@ -705,6 +796,23 @@ async fn main(spawner: Spawner) {
                                     rand_core::RngCore::fill_bytes(&mut trng, &mut disco);
                                     let disco =
                                         tailscale_core::key::DiscoPrivate::from_bytes(disco);
+                                    // Before the poll, because the poll is
+                                    // read-only: this is the only request on
+                                    // the connection the server will accept a
+                                    // description of this device from.
+                                    if let Err(e) = advertise(
+                                        &mut conn,
+                                        &mut socket,
+                                        host,
+                                        &node_key.public(),
+                                        &disco.public(),
+                                        endpoint.as_str(),
+                                        routes,
+                                    )
+                                    .await
+                                    {
+                                        logln!("advertise failed: {:?}", e);
+                                    }
                                     // A long-poll is quiet by design: the
                                     // server holds the response open and sends
                                     // nothing until the tailnet changes. The
@@ -771,7 +879,6 @@ async fn main(spawner: Spawner) {
                                             host,
                                             &node_key.public(),
                                             &disco.public(),
-                                            endpoint.as_str(),
                                         ),
                                         wg::serve(stack, &node_key, &disco, wg_index),
                                         relay,

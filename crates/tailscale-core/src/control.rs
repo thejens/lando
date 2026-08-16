@@ -90,6 +90,15 @@ pub struct Hostinfo<'a> {
     /// as a `DERP` placeholder address and strips `NetInfo` itself, so the
     /// field is invisible in a peer's netmap even when it is working.
     pub preferred_derp: u32,
+    /// Measured round-trip to the home relay, in milliseconds.
+    ///
+    /// Reported as `DERPLatency`. The admin console shows this under Relays,
+    /// and a node with no latency data appears to have no relay at all.
+    pub derp_latency_ms: Option<u32>,
+    /// Whether UDP reaches the internet. Reported rather than assumed: the
+    /// console surfaces it, and it is what tells the control plane a direct
+    /// path is even worth attempting.
+    pub working_udp: bool,
 }
 
 impl Default for Hostinfo<'_> {
@@ -106,6 +115,8 @@ impl Default for Hostinfo<'_> {
             machine: "thumbv8m",
             routable_ips: &[],
             preferred_derp: 0,
+            derp_latency_ms: None,
+            working_udp: false,
         }
     }
 }
@@ -121,9 +132,36 @@ impl Hostinfo<'_> {
         w.field_str("Hostname", self.hostname)?;
         w.field_str("Machine", self.machine)?;
         if self.preferred_derp != 0 {
+            // A complete NetInfo, not just the one field we care about. Every
+            // entry here has its own column in the admin console, and a
+            // partially-filled struct appears to be ignored wholesale rather
+            // than accepted in part.
             w.key("NetInfo")?;
             w.begin_object()?;
+            w.field_bool("MappingVariesByDestIP", false)?;
+            w.field_bool("WorkingIPv6", false)?;
+            w.field_bool("OSHasIPv6", false)?;
+            w.field_bool("WorkingUDP", self.working_udp)?;
+            w.field_bool("HavePortMap", false)?;
+            w.field_bool("UPnP", false)?;
+            w.field_bool("PMP", false)?;
+            w.field_bool("PCP", false)?;
             w.field_u64("PreferredDERP", self.preferred_derp as u64)?;
+            if let Some(ms) = self.derp_latency_ms {
+                // DERPLatency is keyed by region and address family, in
+                // seconds — rendered by hand because the JSON writer has no
+                // float support and does not need one for anything else.
+                w.key("DERPLatency")?;
+                w.begin_object()?;
+                let mut key: [u8; 16] = [0; 16];
+                let region = write_region_key(self.preferred_derp, &mut key);
+                w.key(core::str::from_utf8(region).map_err(|_| JsonError::Malformed)?)?;
+                let mut secs = [0u8; 12];
+                let rendered = write_seconds(ms, &mut secs);
+                w.raw_value(rendered)?;
+                w.end_object()?;
+            }
+            w.field_str("LinkType", "wifi")?;
             w.end_object()?;
         }
         if !self.routable_ips.is_empty() {
@@ -209,6 +247,19 @@ pub struct MapRequest<'a> {
     pub disco_key: &'a DiscoPublic,
     pub hostinfo: &'a Hostinfo<'a>,
     /// Long-poll rather than one-shot.
+    ///
+    /// **A streaming request is read-only.** Upstream specifies that when
+    /// `Stream` is set and `Version >= 68` the server treats the request as
+    /// read-only and ignores `Hostinfo`, `Endpoints` and everything else that
+    /// describes us. So none of the fields below reach the control plane on a
+    /// streaming poll — they are only read from a one-shot request.
+    ///
+    /// This failure is completely silent: the node still goes online, and the
+    /// admin console simply shows no endpoints, no relay and no connectivity
+    /// data, as though the client had never described itself. Send changes
+    /// with a one-shot [`MapRequest`] (`stream: false`, `omit_peers: true`),
+    /// which is the documented way to update endpoints without disturbing an
+    /// existing long poll.
     pub stream: bool,
     /// Ask the server to send periodic keep-alive frames.
     pub keep_alive: bool,
@@ -227,33 +278,10 @@ pub struct MapRequest<'a> {
     /// mismatched array is grounds to discard the endpoints entirely — with
     /// no error, so the node simply appears to have none.
     pub endpoint_types: &'a [u8],
-    /// Relay region we are reachable through, or 0 for none.
-    ///
-    /// **Advertising this is what makes the node reachable at all.** A node
-    /// with no home relay and no direct endpoints appears in peers' netmaps
-    /// with nowhere to send, so they never send anything — and the symptom is
-    /// simply silence, with no error at either end.
-    pub home_derp: u32,
 }
 
-/// How an endpoint was learned. The control plane pairs these with
-/// `MapRequest.Endpoints` by position.
-pub mod endpoint_type {
-    pub const UNKNOWN: u8 = 0;
-    /// Discovered from a local interface — a LAN address.
-    pub const LOCAL: u8 = 1;
-    pub const STUN: u8 = 2;
-    pub const PORTMAPPED: u8 = 3;
-    pub const STUN4_LOCAL_PORT: u8 = 4;
-    pub const EXPLICIT_CONF: u8 = 5;
-}
-
-/// Placeholder address family Tailscale uses to express "reachable via relay
-/// region N" in an endpoint list. The same encoding appears on peers' `DERP`
-/// fields, which is how [`peers`] reads it back.
-fn write_derp_endpoint(region: u32, out: &mut [u8; 24]) -> &[u8] {
-    const PREFIX: &[u8] = b"127.3.3.40:";
-    out[..PREFIX.len()].copy_from_slice(PREFIX);
+/// Renders `"<region>-v4"`, the key DERPLatency is indexed by.
+fn write_region_key(region: u32, out: &mut [u8; 16]) -> &[u8] {
     let mut digits = [0u8; 10];
     let mut n = region;
     let mut i = 10;
@@ -267,8 +295,33 @@ fn write_derp_endpoint(region: u32, out: &mut [u8; 24]) -> &[u8] {
         n /= 10;
     }
     let len = 10 - i;
-    out[PREFIX.len()..PREFIX.len() + len].copy_from_slice(&digits[i..]);
-    &out[..PREFIX.len() + len]
+    out[..len].copy_from_slice(&digits[i..]);
+    out[len..len + 3].copy_from_slice(b"-v4");
+    &out[..len + 3]
+}
+
+/// Renders milliseconds as a decimal number of seconds, e.g. 55 -> "0.055".
+fn write_seconds(ms: u32, out: &mut [u8; 12]) -> &[u8] {
+    let whole = ms / 1000;
+    let frac = ms % 1000;
+    out[0] = b'0' + (whole % 10) as u8;
+    out[1] = b'.';
+    out[2] = b'0' + (frac / 100) as u8;
+    out[3] = b'0' + ((frac / 10) % 10) as u8;
+    out[4] = b'0' + (frac % 10) as u8;
+    &out[..5]
+}
+
+/// How an endpoint was learned. The control plane pairs these with
+/// `MapRequest.Endpoints` by position.
+pub mod endpoint_type {
+    pub const UNKNOWN: u8 = 0;
+    /// Discovered from a local interface — a LAN address.
+    pub const LOCAL: u8 = 1;
+    pub const STUN: u8 = 2;
+    pub const PORTMAPPED: u8 = 3;
+    pub const STUN4_LOCAL_PORT: u8 = 4;
+    pub const EXPLICIT_CONF: u8 = 5;
 }
 
 /// Serializes a `MapRequest` into `out`, returning its length.
@@ -305,16 +358,11 @@ pub fn write_map_request(out: &mut [u8], req: &MapRequest) -> Result<usize, Json
     if req.omit_peers {
         w.field_bool("OmitPeers", true)?;
     }
-    if req.home_derp != 0 || !req.endpoints.is_empty() {
+    if !req.endpoints.is_empty() {
         w.key("Endpoints")?;
         w.begin_array()?;
         for ep in req.endpoints {
             w.str_value(ep)?;
-        }
-        if req.home_derp != 0 {
-            let mut buf = [0u8; 24];
-            let ep = write_derp_endpoint(req.home_derp, &mut buf);
-            w.str_value(core::str::from_utf8(ep).map_err(|_| JsonError::Malformed)?)?;
         }
         w.end_array()?;
 
@@ -485,7 +533,12 @@ pub fn peers(netmap: &[u8]) -> impl Iterator<Item = PeerInfo<'_>> + '_ {
 /// relay as a placeholder address of the form `127.3.3.40:<region>` rather
 /// than as a plain number.
 fn derp_region(s: &str) -> Option<u32> {
-    s.rsplit(':').next()?.parse().ok()
+    // The prefix is checked, not assumed. This reads a peer's `DERP` field,
+    // which is documented to hold the placeholder — but taking the port off
+    // whatever happens to be there would turn a real address into a plausible
+    // region number, and a wrong region is silent misrouting rather than an
+    // error.
+    s.strip_prefix("127.3.3.40:")?.parse().ok()
 }
 
 /// The parts of `RegisterResponse` a headless device acts on.
@@ -726,7 +779,6 @@ mod tests {
                 omit_peers: false,
                 endpoints: &[],
                 endpoint_types: &[],
-                home_derp: 0,
             },
         )
         .unwrap();
@@ -741,34 +793,19 @@ mod tests {
 
     /// Advertising a home relay is what makes a node reachable; without it
     /// peers have nowhere to send and simply stay silent.
+    ///
+    /// The shape matters as much as the contents: this has to be a *one-shot*
+    /// request, because the server discards `Hostinfo` and `Endpoints` on a
+    /// streaming one.
     #[test]
     fn map_request_advertises_the_home_relay() {
         let node = NodePrivate::from_bytes([5u8; 32]).public();
         let disco = crate::key::DiscoPrivate::from_bytes([6u8; 32]).public();
-        let hi = Hostinfo::default();
         let mut buf = [0u8; 1024];
-        let n = write_map_request(
-            &mut buf,
-            &MapRequest {
-                capability_version: 145,
-                node_key: &node,
-                disco_key: &disco,
-                hostinfo: &hi,
-                stream: true,
-                keep_alive: true,
-                omit_peers: false,
-                endpoints: &[],
-                endpoint_types: &[],
-                home_derp: 12,
-            },
-        )
-        .unwrap();
-        assert!(as_str(&buf[..n]).contains(r#""Endpoints":["127.3.3.40:12"]"#));
-
-        // The same region also travels inside Hostinfo.NetInfo, which is what
-        // the server actually turns into a peer-visible DERP address.
         let hi = Hostinfo {
             preferred_derp: 12,
+            derp_latency_ms: Some(55),
+            working_udp: true,
             ..Default::default()
         };
         let n = write_map_request(
@@ -778,28 +815,36 @@ mod tests {
                 node_key: &node,
                 disco_key: &disco,
                 hostinfo: &hi,
-                stream: true,
-                keep_alive: true,
-                omit_peers: false,
-                endpoints: &[],
-                endpoint_types: &[],
-                home_derp: 12,
+                stream: false,
+                keep_alive: false,
+                omit_peers: true,
+                endpoints: &["192.168.86.42:41641"],
+                endpoint_types: &[endpoint_type::LOCAL],
             },
         )
         .unwrap();
-        assert!(as_str(&buf[..n]).contains(r#""NetInfo":{"PreferredDERP":12}"#));
+        let out = as_str(&buf[..n]);
+        // A complete NetInfo, not just the one field: the control plane
+        // appears to ignore a partially-filled struct wholesale.
+        assert!(out.contains(r#""PreferredDERP":12"#));
+        assert!(out.contains(r#""WorkingUDP":true"#));
+        assert!(out.contains(r#""MappingVariesByDestIP":false"#));
+        assert!(out.contains(r#""DERPLatency":{"12-v4":0.055}"#));
+        assert!(out.contains(r#""LinkType":"wifi""#));
+        assert!(out.contains(r#""Endpoints":["192.168.86.42:41641"]"#));
+        // Anything that would make the server treat this as read-only.
+        assert!(!out.contains("Stream"));
+        assert!(!out.contains("ReadOnly"));
     }
 
+    /// `127.3.3.40:N` is how the server says "reachable via relay region N"
+    /// in a peer's endpoint list. We only ever read it; advertising our own
+    /// relay goes through `Hostinfo.NetInfo.PreferredDERP` instead.
     #[test]
-    fn derp_endpoint_placeholder_round_trips() {
-        let mut b = [0u8; 24];
-        assert_eq!(write_derp_endpoint(1, &mut b), b"127.3.3.40:1");
-        assert_eq!(write_derp_endpoint(0, &mut b), b"127.3.3.40:0");
-        assert_eq!(write_derp_endpoint(255, &mut b), b"127.3.3.40:255");
-        // The writer and the reader must agree on the encoding.
-        let mut b = [0u8; 24];
-        let s = core::str::from_utf8(write_derp_endpoint(42, &mut b)).unwrap();
-        assert_eq!(derp_region(s), Some(42));
+    fn derp_placeholder_is_read_back() {
+        assert_eq!(derp_region("127.3.3.40:1"), Some(1));
+        assert_eq!(derp_region("127.3.3.40:255"), Some(255));
+        assert_eq!(derp_region("192.168.86.41:41641"), None);
     }
 
     /// The length prefix is little-endian here, unlike every other length on
