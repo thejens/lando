@@ -1231,6 +1231,7 @@ dependencies = [
  "log",
  "panic-halt",
  "rand_core 0.6.4",
+ "smoltcp",
  "static_cell",
  "tailscale-core",
 ]

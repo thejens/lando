@@ -33,6 +33,14 @@ pub const PORT: u16 = 41641;
 /// whichever transport called it. Nothing is held across an await.
 pub type Shared = Mutex<CriticalSectionRawMutex, RefCell<Node>>;
 
+/// What handling a packet produced.
+pub enum Action {
+    /// Ciphertext to send straight back the way the packet came.
+    Reply(usize),
+    /// A decrypted IP packet addressed to the LAN, for the tunnel to route.
+    Deliver(usize),
+}
+
 /// Where a packet came from, and so where its reply must go.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Source {
@@ -80,7 +88,7 @@ impl Node {
     ///
     /// Deliberately synchronous: the caller owns the transport, so the same
     /// logic serves UDP and DERP without either being able to block the other.
-    pub fn handle(&mut self, packet: &[u8], from: Source, out: &mut [u8]) -> Option<usize> {
+    pub fn handle(&mut self, packet: &[u8], from: Source, out: &mut [u8]) -> Option<Action> {
         // disco and WireGuard share a transport; the magic tells them apart.
         // Answering disco is what makes a peer willing to send WireGuard here
         // at all -- without a pong it never validates the endpoint.
@@ -114,7 +122,7 @@ impl Node {
             )
             .ok()?;
             logln!("disco: ping answered, endpoint validated");
-            return Some(len);
+            return Some(Action::Reply(len));
         }
 
         match *packet.first()? {
@@ -139,7 +147,7 @@ impl Node {
                     session: Session::new(&keys),
                     source: from,
                 });
-                Some(response.len())
+                Some(Action::Reply(response.len()))
             }
             MSG_TRANSPORT => {
                 let slot = self.peer.as_mut()?;
@@ -152,21 +160,35 @@ impl Node {
 
                 // `tailscale ping` speaks TSMP, so answering it is what makes
                 // the node visibly reachable to the standard tooling.
-                let ping = tsmp::parse_ping(plain)?;
-                let mut pong = [0u8; 64];
-                let len = tsmp::write_pong(&ping, &mut pong)?;
-                let sent = slot.session.encrypt(&pong[..len], out).ok()?;
-                let _ = slot.key;
-                logln!("wg: TSMP ping answered");
-                Some(sent)
+                if let Some(ping) = tsmp::parse_ping(plain) {
+                    let mut pong = [0u8; 64];
+                    let len = tsmp::write_pong(&ping, &mut pong)?;
+                    let sent = slot.session.encrypt(&pong[..len], out).ok()?;
+                    let _ = slot.key;
+                    logln!("wg: TSMP ping answered");
+                    return Some(Action::Reply(sent));
+                }
+                // Anything else is traffic for the LAN. Copied out because the
+                // caller owns the tunnel and this borrow ends here.
+                let len = plain.len();
+                out.get_mut(..len)?.copy_from_slice(plain);
+                Some(Action::Deliver(len))
             }
             _ => None,
         }
     }
+    /// Encrypts a packet from the tunnel for the peer, reporting where to send
+    /// it. `None` when there is no session, which is the normal state until a
+    /// peer has handshaked.
+    pub fn encrypt(&mut self, packet: &[u8], out: &mut [u8]) -> Option<(usize, Source)> {
+        let slot = self.peer.as_mut()?;
+        let n = slot.session.encrypt(packet, out).ok()?;
+        Some((n, slot.source))
+    }
 }
 
 /// Serves WireGuard over UDP until the socket fails.
-pub async fn serve(stack: Stack<'static>, node: &Shared) -> ! {
+pub async fn serve(stack: Stack<'static>, node: &Shared, tunnel: &crate::TunnelShared) -> ! {
     let mut rx_meta = [PacketMetadata::EMPTY; 8];
     let mut rx_buf = [0u8; 2048];
     let mut tx_meta = [PacketMetadata::EMPTY; 8];
@@ -184,16 +206,82 @@ pub async fn serve(stack: Stack<'static>, node: &Shared) -> ! {
     let mut packet = [0u8; 1600];
     let mut out = [0u8; 1600];
     loop {
-        let Ok((n, meta)) = socket.recv_from(&mut packet).await else {
-            continue;
-        };
-        let reply = node.lock(|n2| {
-            n2.borrow_mut()
-                .handle(&packet[..n], Source::Udp(meta.endpoint), &mut out)
-        });
-        if let Some(len) = reply {
-            let _ = socket.send_to(&out[..len], meta.endpoint).await;
+        // Waking on a timer as well as on a packet, because this loop owns the
+        // only send path: the tunnel produces replies on its own schedule, and
+        // draining them only when something else happens to arrive means a
+        // SYN-ACK can sit queued until unrelated traffic shakes it loose.
+        let arrival = embassy_futures::select::select(
+            socket.recv_from(&mut packet),
+            embassy_time::Timer::after(embassy_time::Duration::from_millis(5)),
+        )
+        .await;
+
+        if let embassy_futures::select::Either::First(Ok((n, meta))) = arrival {
+            let action = node.lock(|n2| {
+                n2.borrow_mut()
+                    .handle(&packet[..n], Source::Udp(meta.endpoint), &mut out)
+            });
+            match action {
+                Some(Action::Reply(len)) => {
+                    let _ = socket.send_to(&out[..len], meta.endpoint).await;
+                }
+                Some(Action::Deliver(len)) => {
+                    tunnel.lock(|t| t.borrow_mut().deliver(&out[..len]));
+                }
+                None => {}
+            }
         }
+
+        // Drain whatever the tunnel produced in response. Done here rather
+        // than in the tunnel task because this is where the peer's session
+        // lives, and only one place may hold the nonce counter.
+        loop {
+            let Some(packet) = tunnel.lock(|t| t.borrow_mut().take_outbound()) else {
+                break;
+            };
+            let mut cipher = [0u8; 1600];
+            let Some((len, source)) = node.lock(|n2| n2.borrow_mut().encrypt(&packet, &mut cipher))
+            else {
+                break;
+            };
+            match source {
+                Source::Udp(ep) => {
+                    let _ = socket.send_to(&cipher[..len], ep).await;
+                }
+                // Reached through the relay, which another task owns.
+                Source::Derp(_) => {
+                    let _ = DERP_OUT.try_send(Relayed::new(&cipher[..len]));
+                }
+            }
+        }
+    }
+}
+
+/// Packets bound for a peer that is reached through the relay.
+///
+/// A channel rather than a direct call because the relay connection is owned
+/// by its own task: it has to keep reading frames while this side is writing,
+/// and sharing the TLS connection between them would mean interleaving reads
+/// and writes on one buffer.
+pub static DERP_OUT: embassy_sync::channel::Channel<CriticalSectionRawMutex, Relayed, 2> =
+    embassy_sync::channel::Channel::new();
+
+/// One packet on its way to the relay.
+pub struct Relayed {
+    buf: [u8; 1600],
+    len: usize,
+}
+
+impl Relayed {
+    fn new(packet: &[u8]) -> Self {
+        let mut buf = [0u8; 1600];
+        let len = packet.len().min(buf.len());
+        buf[..len].copy_from_slice(&packet[..len]);
+        Self { buf, len }
+    }
+
+    pub fn as_slice(&self) -> &[u8] {
+        &self.buf[..self.len]
     }
 }
 

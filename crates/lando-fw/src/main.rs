@@ -24,6 +24,7 @@ mod config;
 mod control;
 mod derp;
 mod h2conn;
+mod tunnel;
 mod wg;
 
 use core::fmt::Write as _;
@@ -83,6 +84,15 @@ const CONTROL_KEY: &str =
 /// flash and airtime than the few milliseconds it would save.
 const DERP_REGION: u32 = 28;
 const DERP_HOST: &str = "derp28b.tailscale.com";
+
+/// The tailnet-side stack, shared between the tunnel task that polls it and
+/// the WireGuard path that feeds it. Blocking rather than async because every
+/// operation on it is pure computation; nothing is held across an await.
+pub type TunnelShared =
+    embassy_sync::blocking_mutex::Mutex<
+        embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex,
+        core::cell::RefCell<tunnel::Tunnel>,
+    >;
 
 /// Whether to hold a relay connection. On by default: for a device behind NAT
 /// the relay is the only way in, so this is the primary path rather than an
@@ -845,6 +855,17 @@ async fn main(spawner: Spawner) {
                                             &node_key, &disco, wg_index,
                                         )),
                                     );
+                                    // The tailnet-side stack. Its address is
+                                    // ours; every other address it answers for
+                                    // belongs to the LAN and is reached by
+                                    // opening a second connection to it.
+                                    static TUNNEL_STORAGE: StaticCell<tunnel::Storage> =
+                                        StaticCell::new();
+                                    let tunnel = TunnelShared::new(core::cell::RefCell::new(
+                                        tunnel::Tunnel::new(
+                                            TUNNEL_STORAGE.init(tunnel::Storage::new()),
+                                        ),
+                                    ));
                                     // Both halves block forever by design: the
                                     // poll is what keeps the node online, the
                                     // UDP socket is what makes it reachable.
@@ -893,6 +914,7 @@ async fn main(spawner: Spawner) {
                                                 derp_rx,
                                                 derp_tx,
                                                 &node,
+                                                &tunnel,
                                             )
                                             .await;
                                             logln!(
@@ -905,7 +927,7 @@ async fn main(spawner: Spawner) {
                                         }
                                     };
 
-                                    let polled = embassy_futures::select::select3(
+                                    let polled = embassy_futures::select::select4(
                                         map_poll(
                                             &mut conn,
                                             &mut socket,
@@ -913,12 +935,13 @@ async fn main(spawner: Spawner) {
                                             &node_key.public(),
                                             &disco.public(),
                                         ),
-                                        wg::serve(stack, &node),
+                                        wg::serve(stack, &node, &tunnel),
                                         relay,
+                                        tunnel::serve(stack, &tunnel),
                                     )
                                     .await;
                                     let polled = match polled {
-                                        embassy_futures::select::Either3::First(r) => r,
+                                        embassy_futures::select::Either4::First(r) => r,
                                         _ => Ok(()),
                                     };
                                     match polled {

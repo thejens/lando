@@ -29,6 +29,14 @@ cyw43-pio = "0.10"
 embassy-net = { version = "0.9.1", features = ["tcp", "udp", "dhcpv4", "dns", "medium-ethernet", "proto-ipv4"] }
 rand_core = { version = "0.6", default-features = false }
 heapless = { version = "0.9", default-features = false }
+# Used directly for the tailnet-side stack, which needs AnyIP and a custom phy
+# that embassy-net does not expose. The LAN side still goes through embassy-net.
+smoltcp = { version = "0.13", default-features = false, features = [
+    "medium-ip",
+    "proto-ipv4",
+    "socket-tcp",
+    "iface-max-addr-count-1",
+] }
 embassy-sync = "0.7"
 embassy-usb = "0.6"
 embedded-io-async = "0.7"

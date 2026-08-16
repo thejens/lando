@@ -73,6 +73,7 @@ pub async fn run<'a, R>(
     rx_buf: &'a mut [u8; 2048],
     tx_buf: &'a mut [u8; 2048],
     node: &crate::wg::Shared,
+    tunnel: &crate::TunnelShared,
 ) -> DerpError
 where
     R: embedded_tls::CryptoRngCore,
@@ -150,6 +151,7 @@ where
         &mut staged,
         &mut staged_len,
         server_key,
+        tunnel,
     )
     .await
     {
@@ -245,6 +247,7 @@ async fn pump<S>(
     staged: &mut [u8; 1024],
     staged_len: &mut usize,
     _server_key: [u8; KEY_LEN],
+    tunnel: &crate::TunnelShared,
 ) -> Result<(), DerpError>
 where
     S: Read + Write,
@@ -255,29 +258,52 @@ where
     write_frame(tls, FrameType::NotePreferred, &[1]).await?;
     logln!("derp: connected, relaying");
 
+    // Learned from the first packet a peer relays to us. Replies are addressed
+    // by node key, and the relay has no notion of a "connection" to reply on.
+    let mut peer_key: Option<[u8; KEY_LEN]> = None;
+
     let mut out = [0u8; 1600];
     loop {
-        let (kind, payload, len) = next_frame(reader, staged, staged_len, tls).await?;
+        // Reading and writing are interleaved on one connection: a peer
+        // reached through the relay has replies to send while the relay still
+        // has frames to deliver, and waiting on either alone deadlocks the
+        // other.
+        let next = embassy_futures::select::select(
+            next_frame(reader, staged, staged_len, tls),
+            crate::wg::DERP_OUT.receive(),
+        )
+        .await;
+        let (kind, payload, len) = match next {
+            embassy_futures::select::Either::First(frame) => frame?,
+            embassy_futures::select::Either::Second(relayed) => {
+                if let Some(peer) = peer_key {
+                    send_packet(tls, &peer, relayed.as_slice()).await?;
+                }
+                continue;
+            }
+        };
         match kind {
             FrameType::RecvPacket if len > KEY_LEN => {
                 // `src node key | packet`. The key is both the sender's
                 // identity and the address any reply has to go back to.
                 let mut src = [0u8; KEY_LEN];
                 src.copy_from_slice(&payload[..KEY_LEN]);
-                let reply = node.lock(|n| {
+                peer_key = Some(src);
+                let action = node.lock(|n| {
                     n.borrow_mut().handle(
                         &payload[KEY_LEN..len],
                         crate::wg::Source::Derp(src),
                         &mut out,
                     )
                 });
-                if let Some(n) = reply {
-                    // SendPacket is the mirror of RecvPacket: destination key
-                    // first, then the packet.
-                    let mut frame = [0u8; 1600 + KEY_LEN];
-                    frame[..KEY_LEN].copy_from_slice(&src);
-                    frame[KEY_LEN..KEY_LEN + n].copy_from_slice(&out[..n]);
-                    write_frame(tls, FrameType::SendPacket, &frame[..KEY_LEN + n]).await?;
+                match action {
+                    Some(crate::wg::Action::Reply(n)) => {
+                        send_packet(tls, &src, &out[..n]).await?;
+                    }
+                    Some(crate::wg::Action::Deliver(n)) => {
+                        tunnel.lock(|t| t.borrow_mut().deliver(&out[..n]));
+                    }
+                    None => {}
                 }
             }
             // Answering keeps the relay from deciding we are gone.
@@ -291,6 +317,28 @@ where
             _ => {}
         }
     }
+}
+
+/// Sends a packet to a peer through the relay.
+///
+/// SendPacket is the mirror of RecvPacket: destination key first, then the
+/// packet itself.
+async fn send_packet<S>(
+    tls: &mut S,
+    dst: &[u8; KEY_LEN],
+    packet: &[u8],
+) -> Result<(), DerpError>
+where
+    S: Write,
+{
+    let mut frame = [0u8; 1600 + KEY_LEN];
+    let end = KEY_LEN + packet.len();
+    if end > frame.len() {
+        return Err(DerpError::Protocol);
+    }
+    frame[..KEY_LEN].copy_from_slice(dst);
+    frame[KEY_LEN..end].copy_from_slice(packet);
+    write_frame(tls, FrameType::SendPacket, &frame[..end]).await
 }
 
 /// Writes one framed message.

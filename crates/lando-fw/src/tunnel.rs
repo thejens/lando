@@ -1,0 +1,442 @@
+//! Subnet routing: tailnet TCP in, LAN TCP out.
+//!
+//! Packets arriving over WireGuard are addressed to LAN hosts — `192.168.86.41`,
+//! not to this device — because the tailnet believes this node routes the
+//! subnet. Two ways to honour that: forward the IP packets themselves with
+//! address translation, or terminate each TCP connection here and open a fresh
+//! one to the same destination. This does the latter.
+//!
+//! Re-originating is the tractable choice on a microcontroller. Forwarding raw
+//! IP means tracking translation state per flow and rewriting checksums, and it
+//! needs a raw send path onto the LAN that `embassy-net` does not offer.
+//! Terminating means smoltcp handles sequencing and retransmission on the
+//! tailnet side, `embassy-net` handles it on the LAN side, and this file only
+//! copies bytes between them. The cost is that only TCP crosses — UDP, and so
+//! SSDP discovery, needs its own path.
+//!
+//! The trick that makes it work is smoltcp's AnyIP: without it an interface
+//! only accepts packets addressed to itself, and every routed packet would be
+//! dropped before reaching a socket. With it, a socket listening on a port
+//! accepts a connection to any destination, and `local_endpoint` reports which
+//! address the peer was actually trying to reach — which is precisely the
+//! address to dial on the LAN.
+
+use embassy_net::tcp::TcpSocket;
+use embassy_net::Stack;
+use embassy_time::{Duration, Instant, Timer};
+use heapless::Vec;
+use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet, SocketStorage};
+use smoltcp::phy::{Device, DeviceCapabilities, Medium};
+use smoltcp::socket::tcp;
+use smoltcp::time::Instant as SmolInstant;
+use smoltcp::wire::{HardwareAddress, IpAddress, Ipv4Address};
+
+use crate::logln;
+
+/// Ports we accept connections on.
+///
+/// A listener is needed per port because smoltcp binds ports, not ranges, so
+/// this list is the limit of what the subnet route actually reaches. 37193 is
+/// the Lyngdorf's UPnP control port; the rest are the ports a LAN device is
+/// most likely to answer on.
+/// Ports repeat on purpose. smoltcp has no accept queue, so one socket serves
+/// one connection at a time — and a browser loading a page opens several at
+/// once, which with a single listener per port deadlocks behind the first.
+pub const PORTS: [u16; 8] = [80, 80, 80, 443, 443, 1400, 37193, 37193];
+
+/// Per-socket buffers. Small deliberately: four listeners plus the LAN side
+/// have to coexist in 520 KB alongside a TLS session and the netmap parser.
+const TCP_RX: usize = 1024;
+const TCP_TX: usize = 1024;
+
+/// Largest IP packet either side will carry.
+const MTU: usize = 1400;
+/// Queue depth each way. Two is enough to absorb a burst without becoming a
+/// buffer that hides backpressure.
+const QUEUE: usize = 2;
+
+type Packet = Vec<u8, MTU>;
+
+/// The tailnet side of the device, as a smoltcp phy.
+///
+/// "Transmit" here means "hand back to WireGuard for encryption", and
+/// "receive" means "a peer sent us this, already decrypted".
+#[derive(Default)]
+pub struct TunnelDevice {
+    inbound: Vec<Packet, QUEUE>,
+    outbound: Vec<Packet, QUEUE>,
+}
+
+pub struct RxToken(Packet);
+pub struct TxToken<'a> {
+    outbound: &'a mut Vec<Packet, QUEUE>,
+}
+
+impl smoltcp::phy::RxToken for RxToken {
+    fn consume<R, F: FnOnce(&[u8]) -> R>(self, f: F) -> R {
+        f(&self.0)
+    }
+}
+
+impl smoltcp::phy::TxToken for TxToken<'_> {
+    fn consume<R, F: FnOnce(&mut [u8]) -> R>(self, len: usize, f: F) -> R {
+        let mut buf: Packet = Vec::new();
+        let _ = buf.resize(len, 0);
+        let result = f(&mut buf);
+        // Dropping on a full queue is deliberate: TCP will retransmit, where
+        // blocking here would stall the interface poll that drains it.
+        let _ = self.outbound.push(buf);
+        result
+    }
+}
+
+impl Device for TunnelDevice {
+    type RxToken<'a>
+        = RxToken
+    where
+        Self: 'a;
+    type TxToken<'a>
+        = TxToken<'a>
+    where
+        Self: 'a;
+
+    fn receive(&mut self, _t: SmolInstant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
+        if self.inbound.is_empty() {
+            return None;
+        }
+        let packet = self.inbound.remove(0);
+        Some((
+            RxToken(packet),
+            TxToken {
+                outbound: &mut self.outbound,
+            },
+        ))
+    }
+
+    fn transmit(&mut self, _t: SmolInstant) -> Option<Self::TxToken<'_>> {
+        if self.outbound.is_full() {
+            return None;
+        }
+        Some(TxToken {
+            outbound: &mut self.outbound,
+        })
+    }
+
+    fn capabilities(&self) -> DeviceCapabilities {
+        let mut caps = DeviceCapabilities::default();
+        // IP rather than Ethernet: what crosses WireGuard is bare IP, with no
+        // link layer and so no addresses to resolve.
+        caps.medium = Medium::Ip;
+        caps.max_transmission_unit = MTU;
+        caps
+    }
+}
+
+/// Storage for the socket set, which smoltcp requires to outlive the interface.
+pub struct Storage {
+    sockets: [SocketStorage<'static>; PORTS.len()],
+    rx: [[u8; TCP_RX]; PORTS.len()],
+    tx: [[u8; TCP_TX]; PORTS.len()],
+}
+
+impl Storage {
+    pub const fn new() -> Self {
+        Self {
+            sockets: [SocketStorage::EMPTY; PORTS.len()],
+            rx: [[0; TCP_RX]; PORTS.len()],
+            tx: [[0; TCP_TX]; PORTS.len()],
+        }
+    }
+}
+
+pub struct Tunnel {
+    pub device: TunnelDevice,
+    iface: Interface,
+    sockets: SocketSet<'static>,
+    listeners: Vec<(SocketHandle, u16), { PORTS.len() }>,
+    /// Sockets a worker is already splicing. Without this two workers pick up
+    /// the same connection and copy each other's bytes into it.
+    claimed: [bool; PORTS.len()],
+}
+
+impl Tunnel {
+    /// Builds the tailnet-side stack, listening on every port in [`PORTS`].
+    ///
+    /// The interface deliberately has no address of its own. Under AnyIP it
+    /// accepts every destination regardless, and each accepted socket answers
+    /// from the address the peer dialled — so an address here would only ever
+    /// describe traffic aimed at this node, which `wg` has already answered
+    /// (TSMP) before anything reaches the tunnel.
+    pub fn new(storage: &'static mut Storage) -> Self {
+        let mut device = TunnelDevice::default();
+        let config = Config::new(HardwareAddress::Ip);
+        let mut iface = Interface::new(config, &mut device, SmolInstant::from_millis(0));
+        // Without this the interface drops every packet not addressed to
+        // itself — which, for a subnet router, is all of them.
+        iface.set_any_ip(true);
+
+        let mut sockets = SocketSet::new(&mut storage.sockets[..]);
+        let mut listeners = Vec::new();
+        for (i, (rx, tx)) in storage.rx.iter_mut().zip(storage.tx.iter_mut()).enumerate() {
+            let socket = tcp::Socket::new(
+                tcp::SocketBuffer::new(&mut rx[..]),
+                tcp::SocketBuffer::new(&mut tx[..]),
+            );
+            let handle = sockets.add(socket);
+            let port = PORTS[i];
+            if sockets.get_mut::<tcp::Socket>(handle).listen(port).is_ok() {
+                let _ = listeners.push((handle, port));
+            }
+        }
+
+        Self {
+            device,
+            iface,
+            sockets,
+            listeners,
+            claimed: [false; PORTS.len()],
+        }
+    }
+
+    /// Queues a decrypted packet from a peer. Dropped if the queue is full;
+    /// TCP treats that as loss and retransmits.
+    pub fn deliver(&mut self, packet: &[u8]) {
+        let mut buf: Packet = Vec::new();
+        if buf.extend_from_slice(packet).is_ok() {
+            let _ = self.device.inbound.push(buf);
+        }
+    }
+
+    /// Takes one packet bound for a peer, ready to encrypt.
+    pub fn take_outbound(&mut self) -> Option<Packet> {
+        if self.device.outbound.is_empty() {
+            None
+        } else {
+            Some(self.device.outbound.remove(0))
+        }
+    }
+
+    pub fn poll(&mut self, now: Instant) {
+        let t = SmolInstant::from_millis(now.as_millis() as i64);
+        self.iface.poll(t, &mut self.device, &mut self.sockets);
+    }
+
+    /// Claims a socket with a connection waiting to be served, together with
+    /// the address the peer was trying to reach.
+    fn claim(&mut self) -> Option<(usize, SocketHandle, Ipv4Address, u16)> {
+        for (i, (handle, _)) in self.listeners.iter().enumerate() {
+            if self.claimed[i] {
+                continue;
+            }
+            let socket = self.sockets.get_mut::<tcp::Socket>(*handle);
+            if !socket.may_recv() && !socket.may_send() {
+                continue;
+            }
+            // `local_endpoint` is the destination the peer addressed, which
+            // AnyIP let through — this is the whole point of the design.
+            let Some(local) = socket.local_endpoint() else {
+                continue;
+            };
+            // Only IPv4 is compiled in, so the address needs no discrimination.
+            let IpAddress::Ipv4(addr) = local.addr;
+            let handle = *handle;
+            self.claimed[i] = true;
+            return Some((i, handle, addr, local.port));
+        }
+        None
+    }
+
+    fn socket(&mut self, handle: SocketHandle) -> &mut tcp::Socket<'static> {
+        self.sockets.get_mut::<tcp::Socket>(handle)
+    }
+
+    /// Returns the socket to service after a connection ends.
+    ///
+    /// The poll between abort and listen is load-bearing: `abort` queues a RST
+    /// and the socket is not closed until the interface has run, so listening
+    /// immediately fails. Swallowing that error retires the socket silently —
+    /// the first connection on a port works and every later one is refused,
+    /// which looks like the LAN host rejecting connections rather than a
+    /// listener that never came back.
+    fn relisten(&mut self, slot: usize, handle: SocketHandle, port: u16) -> bool {
+        self.socket(handle).abort();
+        self.poll(Instant::now());
+        let socket = self.socket(handle);
+        if socket.is_open() {
+            socket.close();
+            self.poll(Instant::now());
+        }
+        let socket = self.socket(handle);
+        let ok = socket.listen(port).is_ok();
+        self.claimed[slot] = false;
+        ok
+    }
+}
+
+/// Runs the tunnel: polls the tailnet stack and services one connection at a
+/// time, splicing it onto the LAN.
+///
+/// One at a time is a deliberate v1 limit rather than a protocol one. Each
+/// concurrent connection costs a second pair of buffers on both sides, and the
+/// traffic this exists for — SOAP calls to an amplifier — is sequential. The
+/// structure holds the limit in one place so raising it is a matter of RAM.
+pub async fn serve(stack: Stack<'static>, tunnel: &crate::TunnelShared) -> ! {
+    // Fixed workers rather than a task per connection: without an allocator
+    // the concurrency limit has to be a constant, and making it visible here
+    // is better than discovering it as a stall. Three is the minimum an
+    // ordinary web page needs — a browser opens several connections at once.
+    let (a, _, _) = embassy_futures::join::join3(
+        worker(stack, tunnel),
+        worker(stack, tunnel),
+        worker(stack, tunnel),
+    )
+    .await;
+    a
+}
+
+/// Serves one connection at a time.
+async fn worker(stack: Stack<'static>, tunnel: &crate::TunnelShared) -> ! {
+    loop {
+        let pending = tunnel.lock(|t| {
+            let mut t = t.borrow_mut();
+            t.poll(Instant::now());
+            t.claim()
+        });
+
+        let Some((slot, handle, dst, port)) = pending else {
+            // Nothing to serve. Poll often enough to keep TCP timers honest
+            // without spinning the executor.
+            Timer::after(Duration::from_millis(20)).await;
+            continue;
+        };
+
+        logln!("tunnel: connection for {}:{}", dst, port);
+        splice(stack, tunnel, handle, dst, port).await;
+        let relistening = tunnel.lock(|t| t.borrow_mut().relisten(slot, handle, port));
+        if !relistening {
+            logln!("tunnel: port {} did not return to service", port);
+        }
+        logln!("tunnel: {}:{} closed", dst, port);
+    }
+}
+
+/// Copies bytes between one tunnel socket and one LAN socket until either ends.
+async fn splice(
+    stack: Stack<'static>,
+    tunnel: &crate::TunnelShared,
+    handle: SocketHandle,
+    dst: Ipv4Address,
+    port: u16,
+) {
+    let mut rx = [0u8; 1024];
+    let mut tx = [0u8; 1024];
+    let mut lan = TcpSocket::new(stack, &mut rx, &mut tx);
+    lan.set_timeout(Some(Duration::from_secs(30)));
+
+    let addr = embassy_net::Ipv4Address::from(dst.octets());
+    if lan.connect((addr, port)).await.is_err() {
+        logln!("tunnel: {}:{} unreachable", dst, port);
+        return;
+    }
+
+    let mut buf = [0u8; 512];
+    // Bytes read from the LAN that the tailnet socket has not accepted yet.
+    // A short write is ordinary flow control — the peer's window is simply
+    // full — so the remainder is held and retried. Treating it as an error
+    // truncates the response instead, which looks like the LAN host closing
+    // the connection early.
+    let mut held = [0u8; 512];
+    // Indices rather than a slice: the same buffer is read into again once
+    // drained, which a borrow of it would forbid.
+    let mut pending = 0usize..0usize;
+    loop {
+        let (from_peer, closed) = tunnel.lock(|t| {
+            let mut t = t.borrow_mut();
+            // Keep the tailnet stack turning: it is what moves the bytes this
+            // loop depends on, so a splice that stops polling deadlocks itself.
+            t.poll(Instant::now());
+            let socket = t.socket(handle);
+            if !socket.is_active() {
+                return (0, true);
+            }
+            let n = if socket.can_recv() {
+                socket.recv_slice(&mut buf).unwrap_or(0)
+            } else {
+                0
+            };
+            (n, false)
+        });
+        if closed {
+            return;
+        }
+        if from_peer > 0
+            && embedded_io_async::Write::write_all(&mut lan, &buf[..from_peer])
+                .await
+                .is_err()
+        {
+            return;
+        }
+
+        // Drain what is already held before taking more from the LAN, or the
+        // reply arrives out of order.
+        if !pending.is_empty() {
+            let chunk = &held[pending.start..pending.end];
+            let sent = tunnel.lock(|t| {
+                let mut t = t.borrow_mut();
+                let socket = t.socket(handle);
+                if socket.can_send() {
+                    socket.send_slice(chunk).unwrap_or(0)
+                } else {
+                    0
+                }
+            });
+            pending.start += sent;
+            if pending.is_empty() {
+                continue;
+            }
+            // Still blocked: let the interface poll above move the window.
+            Timer::after(Duration::from_millis(5)).await;
+            continue;
+        }
+
+        // The LAN side is read with a deadline rather than awaited outright:
+        // this loop also owns polling the tailnet stack, so blocking here
+        // would stall the path the reply has to travel back along.
+        let read = embassy_futures::select::select(
+            embedded_io_async::Read::read(&mut lan, &mut held),
+            Timer::after(Duration::from_millis(10)),
+        )
+        .await;
+        if let embassy_futures::select::Either::First(result) = read {
+            match result {
+                Ok(0) | Err(_) => {
+                    // The LAN host is done. Let the tailnet side flush what it
+                    // still holds before tearing the connection down, or the
+                    // tail of the response is lost.
+                    flush(tunnel, handle).await;
+                    return;
+                }
+                Ok(n) => pending = 0..n,
+            }
+        }
+    }
+}
+
+/// Polls until the tailnet socket has sent everything queued, or gives up.
+///
+/// Bounded because a peer that stops reading must not pin the single
+/// connection slot indefinitely.
+async fn flush(tunnel: &crate::TunnelShared, handle: SocketHandle) {
+    for _ in 0..200 {
+        let done = tunnel.lock(|t| {
+            let mut t = t.borrow_mut();
+            t.poll(Instant::now());
+            let socket = t.socket(handle);
+            !socket.is_active() || socket.send_queue() == 0
+        });
+        if done {
+            return;
+        }
+        Timer::after(Duration::from_millis(10)).await;
+    }
+}
