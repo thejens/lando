@@ -1,0 +1,7 @@
+/target
+
+# Node identity: contains the machine and node private keys.
+.lando-state
+
+# Pre-auth key. A tailnet-joining credential until used or revoked.
+.lando-authkey

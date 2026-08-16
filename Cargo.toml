@@ -1,0 +1,17 @@
+[workspace]
+resolver = "2"
+members = ["crates/tailscale-core", "crates/lando-host"]
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+# Pinned to the RustCrypto digest-0.10 / aead-0.5 generation. Newer majors exist
+# (blake2 0.11-rc, chacha20poly1305 0.11) but they straddle digest 0.11, and
+# mixing generations breaks trait coherence across hkdf/hmac/blake2. Move the
+# whole set at once or not at all.
+blake2 = { version = "0.10", default-features = false }
+chacha20poly1305 = { version = "0.10", default-features = false }
+x25519-dalek = { version = "2", default-features = false, features = ["static_secrets"] }
+rand_core = { version = "0.6", default-features = false }
