@@ -20,7 +20,7 @@ use tailscale_core::wireguard::{Peer, Session, MSG_INITIATION, MSG_RESPONSE, MSG
 
 use crate::derp::{DerpClient, Event};
 use crate::state::hex;
-use crate::tunnel::TunnelStack;
+use crate::tunnel::{Target, TunnelStack};
 
 /// Port the SOCKS5 proxy listens on inside the tunnel.
 pub const SOCKS_PORT: u16 = 1080;
@@ -232,13 +232,41 @@ fn feed_stack(
     }
     if state.stack.is_none() {
         let addr = smoltcp::wire::Ipv4Address::new(packet[16], packet[17], packet[18], packet[19]);
-        println!("  ** tunnel stack listening on {addr}:{SOCKS_PORT}");
-        state.stack = Some(TunnelStack::new(addr, SOCKS_PORT, SOCKET_POOL));
+        let mut ports = vec![(SOCKS_PORT, Target::Socks)];
+        ports.extend(configured_forwards());
+        for (port, target) in &ports {
+            match target {
+                Target::Socks => println!("  ** {addr}:{port} SOCKS5"),
+                Target::Forward(to) => println!("  ** {addr}:{port} -> {to}"),
+            }
+        }
+        state.stack = Some(TunnelStack::new(addr, &ports, SOCKET_POOL));
     }
     state.tunnel_peer = Some(*src);
     let stack = state.stack.as_mut().expect("just created");
     stack.device.push_inbound(packet);
     drain_stack(client, state, now)
+}
+
+/// Reads `LANDO_FORWARD` into a table of transparent forwards.
+///
+/// Format is `listen=host:port`, comma separated, e.g.
+/// `37193=192.168.1.50:37193`. A forwarded port needs nothing configured on
+/// the client: the tunnel address simply behaves as the LAN device does.
+fn configured_forwards() -> Vec<(u16, Target)> {
+    let Ok(spec) = std::env::var("LANDO_FORWARD") else {
+        return Vec::new();
+    };
+    spec.split(',')
+        .filter_map(|entry| {
+            let (listen, target) = entry.trim().split_once('=')?;
+            let listen: u16 = listen.trim().parse().ok()?;
+            let target = std::net::ToSocketAddrs::to_socket_addrs(&target.trim())
+                .ok()?
+                .next()?;
+            Some((listen, Target::Forward(target)))
+        })
+        .collect()
 }
 
 /// Advances the TCP stack and relays whatever it wants to send.
@@ -256,7 +284,7 @@ fn drain_stack(
     stack.poll(now as i64);
     stack.serve();
     stack.poll(now as i64);
-    stack.relisten(SOCKS_PORT);
+    stack.relisten();
 
     let mut pending = Vec::new();
     while let Some(out) = stack.device.pop_outbound() {

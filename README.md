@@ -32,6 +32,7 @@ Early. The control-plane path works against the real hosted control plane.
 | TSMP ping/pong | working — `tailscale ping` succeeds |
 | TCP over the tunnel (smoltcp) | working |
 | SOCKS5 proxy to the LAN | working — reaches a real LAN device |
+| Transparent port-forward | working — no client configuration at all |
 | RP2350 firmware | not started |
 
 A node registered by `lando-host` shows up in the admin console as a real
@@ -49,7 +50,16 @@ It also carries TCP: a SOCKS5 proxy listens on the tunnel address, so any
 tailnet client can reach any host on the LAN the node sits on.
 
 ```
-tailnet client ──WireGuard/DERP──▶ lando:1080 (SOCKS5) ──▶ 192.168.x.x:port
+tailnet client ──WireGuard/DERP──▶ lando:1080  (SOCKS5)      ──▶ any LAN host
+                                   lando:37193 (forwarded)   ──▶ one LAN host
+```
+
+A forwarded port needs nothing configured on the client — the tunnel address
+behaves exactly as the LAN device does:
+
+```sh
+LANDO_FORWARD="37193=192.168.1.50:37193" cargo run -p lando-host -- node
+curl http://lando-tailnet-ip:37193/...        # straight through
 ```
 
 Verified end to end against a real UPnP amplifier: `HTTP/1.1 200 OK`, device

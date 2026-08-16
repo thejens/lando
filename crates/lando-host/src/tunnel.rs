@@ -115,6 +115,22 @@ pub struct TunnelStack {
     listeners: Vec<smoltcp::iface::SocketHandle>,
     /// Per-socket proxy state, parallel to `listeners`.
     conns: Vec<Conn>,
+    /// What each socket does once connected, parallel to `listeners`.
+    targets: Vec<Target>,
+    /// Port each socket listens on, so it can be returned to service.
+    ports: Vec<u16>,
+}
+
+/// What a listening port does with a connection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Target {
+    /// Speak SOCKS5 and let the client name the destination.
+    Socks,
+    /// Splice straight to a fixed LAN address, with no negotiation at all.
+    ///
+    /// This is the interface that needs nothing configured on the client: the
+    /// tunnel address and port simply behave as the LAN device does.
+    Forward(SocketAddr),
 }
 
 /// Where a tunnel connection is in the SOCKS5 exchange.
@@ -137,7 +153,12 @@ enum Conn {
 }
 
 impl TunnelStack {
-    pub fn new(address: Ipv4Address, port: u16, pool: usize) -> Self {
+    /// Builds the stack with one socket pool per listening port.
+    ///
+    /// smoltcp has no accept queue, so `pool` sockets per port is a hard
+    /// concurrency limit rather than a tuning knob — on the firmware it is a
+    /// RAM decision.
+    pub fn new(address: Ipv4Address, ports: &[(u16, Target)], pool: usize) -> Self {
         let mut device = TunnelDevice::default();
         let config = Config::new(smoltcp::wire::HardwareAddress::Ip);
         let mut iface = Interface::new(config, &mut device, SmolInstant::from_millis(0));
@@ -148,18 +169,26 @@ impl TunnelStack {
         });
 
         let mut sockets = SocketSet::new(Vec::new());
-        let mut listeners = Vec::with_capacity(pool);
-        for _ in 0..pool {
-            let socket = tcp::Socket::new(
-                tcp::SocketBuffer::new(vec![0u8; TCP_BUFFER]),
-                tcp::SocketBuffer::new(vec![0u8; TCP_BUFFER]),
-            );
-            let handle = sockets.add(socket);
-            let s = sockets.get_mut::<tcp::Socket>(handle);
-            s.listen(port).expect("fresh socket can listen");
-            listeners.push(handle);
+        let mut listeners = Vec::new();
+        let mut targets = Vec::new();
+        let mut bound = Vec::new();
+        for (port, target) in ports {
+            for _ in 0..pool {
+                let socket = tcp::Socket::new(
+                    tcp::SocketBuffer::new(vec![0u8; TCP_BUFFER]),
+                    tcp::SocketBuffer::new(vec![0u8; TCP_BUFFER]),
+                );
+                let handle = sockets.add(socket);
+                sockets
+                    .get_mut::<tcp::Socket>(handle)
+                    .listen(*port)
+                    .expect("fresh socket can listen");
+                listeners.push(handle);
+                targets.push(*target);
+                bound.push(*port);
+            }
         }
-        let conns = (0..pool).map(|_| Conn::Greeting).collect();
+        let conns = (0..listeners.len()).map(|_| Conn::Greeting).collect();
 
         Self {
             device,
@@ -167,6 +196,8 @@ impl TunnelStack {
             sockets,
             listeners,
             conns,
+            targets,
+            ports: bound,
         }
     }
 
@@ -205,30 +236,45 @@ impl TunnelStack {
                 continue;
             }
 
-            match &mut self.conns[i] {
-                Conn::Greeting => {
+            match (&mut self.conns[i], self.targets[i]) {
+                // A forwarded port has nothing to negotiate: dial immediately.
+                (Conn::Greeting | Conn::Request, Target::Forward(addr)) => {
+                    match TcpStream::connect(addr) {
+                        Ok(stream) => {
+                            stream.set_nonblocking(true).ok();
+                            stream.set_nodelay(true).ok();
+                            println!("  ** forward -> {addr}");
+                            self.conns[i] = Conn::Relaying(stream);
+                        }
+                        Err(e) => {
+                            println!("  ** forward to {addr} failed: {e}");
+                            socket.close();
+                        }
+                    }
+                }
+                (Conn::Greeting, Target::Socks) => {
                     if greet(socket) {
                         self.conns[i] = Conn::Request;
                     }
                 }
-                Conn::Request => {
+                (Conn::Request, Target::Socks) => {
                     if let Some(stream) = connect(socket) {
                         self.conns[i] = Conn::Relaying(stream);
                     }
                 }
-                Conn::Relaying(stream) => relay(socket, stream),
+                (Conn::Relaying(stream), _) => relay(socket, stream),
             }
         }
     }
 
-    /// Returns a listening socket to service after its connection ends, so the
-    /// pool does not leak capacity as clients come and go.
-    pub fn relisten(&mut self, port: u16) {
-        for handle in &self.listeners {
+    /// Returns closed sockets to listening, so the pool does not leak capacity
+    /// as clients come and go. Each returns to the port it was bound to.
+    pub fn relisten(&mut self) {
+        for (i, handle) in self.listeners.iter().enumerate() {
             let socket = self.sockets.get_mut::<tcp::Socket>(*handle);
             if !socket.is_open() {
                 socket.abort();
-                let _ = socket.listen(port);
+                let _ = socket.listen(self.ports[i]);
             }
         }
     }
@@ -271,14 +317,19 @@ mod tests {
 
     #[test]
     fn stack_starts_with_every_socket_listening() {
-        let mut stack = TunnelStack::new(Ipv4Address::new(100, 64, 0, 1), 1080, 3);
+        let ports = [
+            (1080, Target::Socks),
+            (37193, Target::Forward("127.0.0.1:9".parse().unwrap())),
+        ];
+        let mut stack = TunnelStack::new(Ipv4Address::new(100, 64, 0, 1), &ports, 3);
         let mut listening = 0;
         stack.for_each_ready(|s| {
             if s.is_listening() {
                 listening += 1;
             }
         });
-        assert_eq!(listening, 3);
+        // A pool per port, so both listeners get their own concurrency.
+        assert_eq!(listening, 6);
     }
 }
 
