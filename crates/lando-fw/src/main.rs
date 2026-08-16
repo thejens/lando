@@ -21,6 +21,7 @@
 #![no_main]
 
 mod config;
+mod control;
 
 use core::fmt::Write as _;
 
@@ -59,6 +60,12 @@ bind_interrupts!(struct Irqs {
 #[used]
 static IMAGE_DEF: embassy_rp::block::ImageDef = embassy_rp::block::ImageDef::secure_exe();
 
+/// The control plane's Noise static, from `GET /key?v=2`. That endpoint is
+/// HTTPS-only, so the device never fetches it — it is pinned here and can be
+/// re-provisioned if it ever rotates.
+const CONTROL_KEY: &str =
+    "mkey:7d2792f9c98d753d2042471536801949104c247f95eac770f8fb321595e2173b";
+
 const LINE_LEN: usize = 128;
 /// Log lines waiting to go out. Bounded, and full means drop: a device whose
 /// network stack stalls because its logging backed up is worse than one that
@@ -69,6 +76,9 @@ static LOGS: Channel<CriticalSectionRawMutex, String<LINE_LEN>, 16> = Channel::n
 #[macro_export]
 macro_rules! logln {
     ($($arg:tt)*) => {{
+        // Scoped inside the macro so callers need not import it, and so a
+        // module that imports a different `Write` still compiles.
+        use core::fmt::Write as _;
         let mut line: heapless::String<128> = heapless::String::new();
         let _ = core::write!(&mut line, $($arg)*);
         let _ = $crate::LOGS.try_send(line);
@@ -381,13 +391,64 @@ async fn main(spawner: Spawner) {
         addr.as_str()
     );
 
+    // ---- control plane ----
+    // Keys from the hardware TRNG. These are ephemeral for now: a real
+    // registration must persist the machine and node keys to flash, or every
+    // reboot creates a new node and burns an auth-key use.
+    let mut key_bytes = [0u8; 32];
+    rand_core::RngCore::fill_bytes(&mut trng, &mut key_bytes);
+    let machine_key = tailscale_core::key::MachinePrivate::from_bytes(key_bytes);
+    rand_core::RngCore::fill_bytes(&mut trng, &mut key_bytes);
+    let ephemeral = tailscale_core::key::MachinePrivate::from_bytes(key_bytes);
+
+    let mut control_status: String<64> = String::new();
+    match tailscale_core::key::MachinePublic::parse(CONTROL_KEY) {
+        Err(_) => {
+            let _ = core::write!(&mut control_status, "bad pinned key");
+        }
+        Ok(control_key) => {
+            static RX: StaticCell<[u8; 4096]> = StaticCell::new();
+            static TX: StaticCell<[u8; 2048]> = StaticCell::new();
+            let started = embassy_time::Instant::now();
+            match control::connect(
+                stack,
+                tailscale_core::DEFAULT_CONTROL_HOST,
+                &control_key,
+                machine_key,
+                ephemeral,
+                tailscale_core::CAPABILITY_VERSION,
+                RX.init([0; 4096]),
+                TX.init([0; 2048]),
+            )
+            .await
+            {
+                Ok((_socket, session)) => {
+                    let bind = session.handshake_hash();
+                    let _ = core::write!(
+                        &mut control_status,
+                        "ts2021 up in {} ms, bind {:02x}{:02x}{:02x}{:02x}",
+                        started.elapsed().as_millis(),
+                        bind[0],
+                        bind[1],
+                        bind[2],
+                        bind[3]
+                    );
+                }
+                Err(e) => {
+                    let _ = core::write!(&mut control_status, "ts2021 failed: {:?}", e);
+                }
+            }
+        }
+    }
+    logln!("control: {}", control_status.as_str());
+
     // The status rides on every tick rather than being logged once at boot:
     // the host opens the CDC port during enumeration, so anything written
     // before an actual reader attaches is drained into a connection nobody is
     // listening to, and boot-time output is effectively unobservable.
     let mut ticks = 0u32;
     loop {
-        logln!("tick {} — radio: {}, addr {}", ticks, status, addr.as_str());
+        logln!("tick {} — {}, addr {}", ticks, control_status.as_str(), addr.as_str());
         ticks = ticks.wrapping_add(1);
         Timer::after(Duration::from_secs(5)).await;
     }

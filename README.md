@@ -36,7 +36,8 @@ Early. The control-plane path works against the real hosted control plane.
 | RP2350 firmware — USB console | working — logs, and reboots to bootloader on `b` |
 | RP2350 firmware — WiFi join | working — associates in ~3 s |
 | RP2350 firmware — network stack | working — DHCP lease on the LAN |
-| RP2350 firmware — datapath port | not started |
+| RP2350 firmware — ts2021 control channel | working — Noise handshake with the real control plane |
+| RP2350 firmware — register / map / WireGuard | not started |
 | USB provisioning to flash | working — image carries no secrets |
 
 A node registered by `lando-host` shows up in the admin console as a real
