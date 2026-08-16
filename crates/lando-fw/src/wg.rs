@@ -1,16 +1,20 @@
-//! WireGuard over UDP, on embassy.
+//! WireGuard, on embassy.
 //!
-//! Answers handshakes and carries tunnel traffic on a plain UDP socket. That
-//! only reaches peers with a path to this device — on a LAN, or through a port
-//! forward — and a NAT'd device needs DERP instead. The direct path is worth
-//! having first regardless: it is the cheapest way to be reachable, and it
-//! requires no TLS stack at all.
+//! Answers handshakes and carries tunnel traffic. Two transports reach this
+//! code: a plain UDP socket, which only works for peers with a path to this
+//! device, and DERP, which is what a NAT'd device needs. Both feed the same
+//! [`Node`], because the peer state is one state machine no matter which way
+//! the bytes arrived — a session established over UDP has to stay usable when
+//! the peer later reaches us through a relay.
 //!
 //! Every protocol decision is `tailscale-core`'s. What lives here is the
 //! socket, the buffers, and the per-peer table.
 
 use embassy_net::udp::{PacketMetadata, UdpSocket};
 use embassy_net::Stack;
+use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+use embassy_sync::blocking_mutex::Mutex;
+use core::cell::RefCell;
 
 use tailscale_core::disco;
 use tailscale_core::key::{DiscoPrivate, DiscoPublic, NodePrivate, NodePublic};
@@ -24,26 +28,145 @@ use crate::logln;
 /// endpoint without being told still finds us.
 pub const PORT: u16 = 41641;
 
+/// Shared node state. Blocking rather than async because [`Node::handle`] does
+/// no I/O: it takes a packet and returns a reply, leaving the sending to
+/// whichever transport called it. Nothing is held across an await.
+pub type Shared = Mutex<CriticalSectionRawMutex, RefCell<Node>>;
+
+/// Where a packet came from, and so where its reply must go.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Source {
+    /// Arrived directly on the UDP socket.
+    Udp(embassy_net::IpEndpoint),
+    /// Relayed, from the peer holding this node key.
+    Derp([u8; 32]),
+}
+
 /// One peer we have a session with. Single-entry for now: this device exists
 /// to be reached by one controller, and a table costs RAM per entry.
 struct PeerSlot {
     key: NodePublic,
     session: Session,
-    endpoint: (embassy_net::IpAddress, u16),
+    source: Source,
 }
 
-/// Serves WireGuard until the socket fails.
-pub async fn serve(
-    stack: Stack<'static>,
-    node_key: &NodePrivate,
-    disco_key: &DiscoPrivate,
-    index_seed: u32,
-) -> ! {
-    let disco_public: DiscoPublic = disco_key.public();
-    // Nonces must never repeat for a key. A counter seeded from the TRNG is
-    // sufficient here and costs nothing to carry.
-    let mut nonce = [0u8; disco::NONCE_LEN];
-    nonce[..4].copy_from_slice(&index_seed.to_le_bytes());
+/// The WireGuard responder, independent of how packets reach it.
+pub struct Node {
+    node_key: NodePrivate,
+    disco_key: DiscoPrivate,
+    disco_public: DiscoPublic,
+    /// Nonces must never repeat for a key. A counter seeded from the TRNG is
+    /// sufficient here and costs nothing to carry.
+    nonce: [u8; disco::NONCE_LEN],
+    peer: Option<PeerSlot>,
+    next_index: u32,
+}
+
+impl Node {
+    pub fn new(node_key: &NodePrivate, disco_key: &DiscoPrivate, index_seed: u32) -> Self {
+        let mut nonce = [0u8; disco::NONCE_LEN];
+        nonce[..4].copy_from_slice(&index_seed.to_le_bytes());
+        Self {
+            node_key: node_key.clone(),
+            disco_key: disco_key.clone(),
+            disco_public: disco_key.public(),
+            nonce,
+            peer: None,
+            next_index: index_seed | 1,
+        }
+    }
+
+    /// Handles one inbound packet, writing any reply into `out`.
+    ///
+    /// Deliberately synchronous: the caller owns the transport, so the same
+    /// logic serves UDP and DERP without either being able to block the other.
+    pub fn handle(&mut self, packet: &[u8], from: Source, out: &mut [u8]) -> Option<usize> {
+        // disco and WireGuard share a transport; the magic tells them apart.
+        // Answering disco is what makes a peer willing to send WireGuard here
+        // at all -- without a pong it never validates the endpoint.
+        if let Ok((header, sealed)) = disco::parse_header(packet) {
+            let mut scratch = [0u8; 256];
+            let plain = disco::open(self.disco_key.as_bytes(), &header, sealed, &mut scratch).ok()?;
+            let ping = disco::parse_ping(plain).ok()?;
+            // The pong echoes the address we saw the ping arrive from. Over a
+            // relay there is no such address, so report the placeholder the
+            // rest of Tailscale uses to mean "via relay region N" — telling a
+            // peer its address is 0.0.0.0 would be worse than telling it
+            // nothing.
+            let (src, port) = match from {
+                Source::Udp(ep) => {
+                    let embassy_net::IpAddress::Ipv4(v4) = ep.addr;
+                    (v4.octets(), ep.port)
+                }
+                Source::Derp(_) => ([127, 3, 3, 40], crate::DERP_REGION as u16),
+            };
+            // Bump before use so no two pongs share a nonce.
+            bump(&mut self.nonce);
+            let len = disco::write_pong(
+                self.disco_key.as_bytes(),
+                &self.disco_public,
+                &header.sender,
+                &self.nonce,
+                &ping.tx_id,
+                src,
+                port,
+                out,
+            )
+            .ok()?;
+            logln!("disco: ping answered, endpoint validated");
+            return Some(len);
+        }
+
+        match *packet.first()? {
+            MSG_INITIATION => {
+                let (responder, learned) =
+                    Responder::consume_initiation(&self.node_key, packet).ok()?;
+                let index = self.next_index;
+                self.next_index = self.next_index.wrapping_add(2).max(1);
+
+                // A fresh ephemeral per handshake; reuse would cost forward
+                // secrecy for the whole session.
+                let mut seed = [0u8; 32];
+                seed[..4].copy_from_slice(&index.to_le_bytes());
+                seed[4..8].copy_from_slice(&(packet.len() as u32).to_le_bytes());
+                let ephemeral = NodePrivate::from_bytes(seed);
+
+                let (response, keys) = responder.respond(ephemeral, index).ok()?;
+                out.get_mut(..response.len())?.copy_from_slice(&response);
+                logln!("wg: session established with a peer (index {})", index);
+                self.peer = Some(PeerSlot {
+                    key: learned.peer_static,
+                    session: Session::new(&keys),
+                    source: from,
+                });
+                Some(response.len())
+            }
+            MSG_TRANSPORT => {
+                let slot = self.peer.as_mut()?;
+                // A peer that moved between transports keeps its session; only
+                // the return path changes.
+                slot.source = from;
+                let mut buf = [0u8; 1600];
+                buf.get_mut(..packet.len())?.copy_from_slice(packet);
+                let plain = slot.session.decrypt(&mut buf[..packet.len()]).ok()?;
+
+                // `tailscale ping` speaks TSMP, so answering it is what makes
+                // the node visibly reachable to the standard tooling.
+                let ping = tsmp::parse_ping(plain)?;
+                let mut pong = [0u8; 64];
+                let len = tsmp::write_pong(&ping, &mut pong)?;
+                let sent = slot.session.encrypt(&pong[..len], out).ok()?;
+                let _ = slot.key;
+                logln!("wg: TSMP ping answered");
+                Some(sent)
+            }
+            _ => None,
+        }
+    }
+}
+
+/// Serves WireGuard over UDP until the socket fails.
+pub async fn serve(stack: Stack<'static>, node: &Shared) -> ! {
     let mut rx_meta = [PacketMetadata::EMPTY; 8];
     let mut rx_buf = [0u8; 2048];
     let mut tx_meta = [PacketMetadata::EMPTY; 8];
@@ -58,108 +181,18 @@ pub async fn serve(
     }
     logln!("wg: listening on udp {}", PORT);
 
-    let mut peer: Option<PeerSlot> = None;
-    let mut next_index = index_seed | 1;
     let mut packet = [0u8; 1600];
-
+    let mut out = [0u8; 1600];
     loop {
         let Ok((n, meta)) = socket.recv_from(&mut packet).await else {
             continue;
         };
-        let from = (meta.endpoint.addr, meta.endpoint.port);
-
-        // disco and WireGuard share this socket; the magic tells them apart.
-        // Answering disco is what makes a peer willing to send WireGuard here
-        // at all -- without a pong it never validates the endpoint.
-        if let Ok((header, sealed)) = disco::parse_header(&packet[..n]) {
-            let mut scratch = [0u8; 256];
-            let Ok(plain) = disco::open(disco_key.as_bytes(), &header, sealed, &mut scratch) else {
-                continue;
-            };
-            let Ok(ping) = disco::parse_ping(plain) else {
-                continue;
-            };
-            let embassy_net::IpAddress::Ipv4(src) = meta.endpoint.addr;
-            // Bump before use so no two pongs share a nonce.
-            bump(&mut nonce);
-            let mut out = [0u8; 256];
-            let Ok(len) = disco::write_pong(
-                disco_key.as_bytes(),
-                &disco_public,
-                &header.sender,
-                &nonce,
-                &ping.tx_id,
-                src.octets(),
-                meta.endpoint.port,
-                &mut out,
-            ) else {
-                continue;
-            };
+        let reply = node.lock(|n2| {
+            n2.borrow_mut()
+                .handle(&packet[..n], Source::Udp(meta.endpoint), &mut out)
+        });
+        if let Some(len) = reply {
             let _ = socket.send_to(&out[..len], meta.endpoint).await;
-            logln!("disco: ping answered, endpoint validated");
-            continue;
-        }
-
-        let Some(&kind) = packet.first() else { continue };
-
-        match kind {
-            MSG_INITIATION => {
-                let Ok((responder, learned)) =
-                    Responder::consume_initiation(node_key, &packet[..n])
-                else {
-                    logln!("wg: bad initiation from {}", from.0);
-                    continue;
-                };
-                let index = next_index;
-                next_index = next_index.wrapping_add(2).max(1);
-
-                // A fresh ephemeral per handshake; reuse would cost forward
-                // secrecy for the whole session.
-                let mut seed = [0u8; 32];
-                seed[..4].copy_from_slice(&index.to_le_bytes());
-                seed[4..8].copy_from_slice(&(n as u32).to_le_bytes());
-                let ephemeral = NodePrivate::from_bytes(seed);
-
-                let Ok((response, keys)) = responder.respond(ephemeral, index) else {
-                    continue;
-                };
-                if socket.send_to(&response, meta.endpoint).await.is_err() {
-                    continue;
-                }
-                logln!("wg: session established with a peer (index {})", index);
-                peer = Some(PeerSlot {
-                    key: learned.peer_static,
-                    session: Session::new(&keys),
-                    endpoint: from,
-                });
-            }
-            MSG_TRANSPORT => {
-                let Some(slot) = peer.as_mut() else { continue };
-                let mut buf = [0u8; 1600];
-                buf[..n].copy_from_slice(&packet[..n]);
-                let Ok(plain) = slot.session.decrypt(&mut buf[..n]) else {
-                    continue;
-                };
-
-                // `tailscale ping` speaks TSMP, so answering it is what makes
-                // the node visibly reachable to the standard tooling.
-                if let Some(ping) = tsmp::parse_ping(plain) {
-                    let mut pong = [0u8; 64];
-                    let Some(len) = tsmp::write_pong(&ping, &mut pong) else {
-                        continue;
-                    };
-                    let mut out = [0u8; 256];
-                    let Ok(sent) = slot.session.encrypt(&pong[..len], &mut out) else {
-                        continue;
-                    };
-                    let dst = embassy_net::IpEndpoint::new(slot.endpoint.0, slot.endpoint.1);
-                    let _ = socket.send_to(&out[..sent], dst).await;
-                    logln!("wg: TSMP ping answered");
-                } else {
-                    let _ = slot.key;
-                }
-            }
-            _ => {}
         }
     }
 }

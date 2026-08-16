@@ -84,9 +84,11 @@ const CONTROL_KEY: &str =
 const DERP_REGION: u32 = 28;
 const DERP_HOST: &str = "derp28b.tailscale.com";
 
-/// Set by the console's `derp` command.
+/// Whether to hold a relay connection. On by default: for a device behind NAT
+/// the relay is the only way in, so this is the primary path rather than an
+/// experiment. The console's `derp` command can still turn it off.
 static DERP_ENABLED: core::sync::atomic::AtomicBool =
-    core::sync::atomic::AtomicBool::new(false);
+    core::sync::atomic::AtomicBool::new(true);
 
 const LINE_LEN: usize = 128;
 /// Log lines waiting to go out. Bounded, and full means drop: a device whose
@@ -834,6 +836,15 @@ async fn main(spawner: Spawner) {
                                     let mut wg_seed = [0u8; 4];
                                     rand_core::RngCore::fill_bytes(&mut trng, &mut wg_seed);
                                     let wg_index = u32::from_le_bytes(wg_seed);
+                                    // One state machine, two transports. A
+                                    // session negotiated over UDP has to stay
+                                    // usable when the peer later arrives via
+                                    // the relay, so neither path may own it.
+                                    let node = wg::Shared::new(
+                                        core::cell::RefCell::new(wg::Node::new(
+                                            &node_key, &disco, wg_index,
+                                        )),
+                                    );
                                     // Both halves block forever by design: the
                                     // poll is what keeps the node online, the
                                     // UDP socket is what makes it reachable.
@@ -844,11 +855,6 @@ async fn main(spawner: Spawner) {
                                         StaticCell::new();
                                     static DERP_RX: StaticCell<[u8; 2048]> = StaticCell::new();
                                     static DERP_TX: StaticCell<[u8; 2048]> = StaticCell::new();
-                                    // Opt-in rather than automatic. DERP is
-                                    // the least-proven path here, and running
-                                    // it at boot means a fault in it takes the
-                                    // whole device down before the console can
-                                    // be used to recover.
                                     let relay = async {
                                         // Polled, not checked once: the flag
                                         // lives in RAM and is set by the
@@ -860,24 +866,43 @@ async fn main(spawner: Spawner) {
                                         {
                                             Timer::after(Duration::from_secs(1)).await;
                                         }
-                                        match derp::connect(
-                                            stack,
-                                            DERP_HOST,
-                                            node_key.as_bytes(),
-                                            node_key.public().as_bytes(),
-                                            &mut trng,
-                                            DERP_BUFS.init(derp::Buffers::new()),
-                                            DERP_RX.init([0; 2048]),
-                                            DERP_TX.init([0; 2048]),
-                                        )
-                                        .await
-                                        {
-                                            Ok(_) => logln!("derp: handshake complete"),
-                                            Err(e) => logln!("derp: failed: {:?}", e),
+                                        // Reconnect rather than give up: a
+                                        // dropped relay is a loss of
+                                        // reachability, and the device has no
+                                        // other way back for a peer that is
+                                        // not on this LAN.
+                                        //
+                                        // Claimed once, outside the loop:
+                                        // a StaticCell panics on a second
+                                        // init, so reconnecting would take
+                                        // the device down on the first
+                                        // retry.
+                                        let derp_bufs =
+                                            DERP_BUFS.init(derp::Buffers::new());
+                                        let derp_rx = DERP_RX.init([0; 2048]);
+                                        let derp_tx = DERP_TX.init([0; 2048]);
+                                        let mut backoff = 1u64;
+                                        loop {
+                                            let e = derp::run(
+                                                stack,
+                                                DERP_HOST,
+                                                node_key.as_bytes(),
+                                                node_key.public().as_bytes(),
+                                                &mut trng,
+                                                derp_bufs,
+                                                derp_rx,
+                                                derp_tx,
+                                                &node,
+                                            )
+                                            .await;
+                                            logln!(
+                                                "derp: lost ({:?}), retry in {}s",
+                                                e,
+                                                backoff
+                                            );
+                                            Timer::after(Duration::from_secs(backoff)).await;
+                                            backoff = (backoff * 2).min(60);
                                         }
-                                        // Hold the future open so the select
-                                        // keeps running the other two.
-                                        core::future::pending::<()>().await
                                     };
 
                                     let polled = embassy_futures::select::select3(
@@ -888,7 +913,7 @@ async fn main(spawner: Spawner) {
                                             &node_key.public(),
                                             &disco.public(),
                                         ),
-                                        wg::serve(stack, &node_key, &disco, wg_index),
+                                        wg::serve(stack, &node),
                                         relay,
                                     )
                                     .await;
