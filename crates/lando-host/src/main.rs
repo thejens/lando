@@ -4,6 +4,7 @@
 //! firmware is flashed. The Pico has no debugger — logging is over USB CDC and
 //! nothing else — so a bug that reproduces here should never be chased there.
 
+mod derp;
 mod state;
 mod transport;
 
@@ -42,7 +43,43 @@ fn main() {
     }
 }
 
+/// Connects to a DERP relay and completes its handshake.
+///
+/// Separate from the control-plane flow because it exercises a different
+/// stack: TLS rather than Noise, and the node key rather than the machine key.
+fn derp_check(state: &State) -> Result<(), String> {
+    let relay = std::env::var("LANDO_DERP").unwrap_or_else(|_| "derp1.tailscale.com".into());
+    println!("relay        : {relay}:443 (TLS, certificate verified)");
+    println!("node pub     : {}", hex(state.node_key.public().as_bytes()));
+
+    let started = std::time::Instant::now();
+    let mut client = derp::DerpClient::connect(
+        &relay,
+        state.node_key.as_bytes(),
+        state.node_key.public().as_bytes(),
+    )?;
+    println!("handshake    : OK ({:?})", started.elapsed());
+    println!("server key   : {}", hex(client.server_key()));
+    println!();
+    println!("Listening for relay events (Ctrl-C to stop)...");
+    loop {
+        match client.next_event()? {
+            derp::Event::Packet { src, data } => {
+                println!("  packet from {} ({} bytes)", hex(&src[..8]), data.len());
+            }
+            derp::Event::PeerPresent(k) => println!("  peer present: {}", hex(&k[..8])),
+            derp::Event::PeerGone(k) => println!("  peer gone:    {}", hex(&k[..8])),
+            derp::Event::KeepAlive => println!("  keep-alive"),
+            derp::Event::Other(kind) => println!("  {kind:?}"),
+        }
+    }
+}
+
 fn run() -> Result<(), String> {
+    if std::env::args().nth(1).as_deref() == Some("derp") {
+        let (state, _) = State::load_or_create(&State::path())?;
+        return derp_check(&state);
+    }
     let host = std::env::var("LANDO_CONTROL_HOST").unwrap_or_else(|_| DEFAULT_CONTROL_HOST.into());
     let key_str = std::env::var("LANDO_CONTROL_KEY").unwrap_or_else(|_| PINNED_CONTROL_KEY.into());
     let hostname = std::env::var("LANDO_HOSTNAME").unwrap_or_else(|_| "lando".into());

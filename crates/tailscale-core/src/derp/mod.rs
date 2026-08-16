@@ -19,7 +19,7 @@
 pub mod frame;
 pub mod handshake;
 
-pub use frame::{Frame, FrameReader, FrameType, MAX_FRAME_LEN};
+pub use frame::{parse_server_key, Frame, FrameReader, FrameType, MAX_FRAME_LEN};
 pub use handshake::{client_info_payload, open, seal};
 
 /// Sent by the server as the first thing on a new connection, ahead of its

@@ -27,14 +27,17 @@ Early. The control-plane path works against the real hosted control plane.
 | WireGuard handshake (both roles) | working — interops with boringtun |
 | WireGuard transport + replay window | working — interops with boringtun |
 | WireGuard timers / rekey / cookies | not started |
-| DERP relay client | not started |
+| DERP framing + NaCl handshake | working — handshakes with a live relay |
+| DERP packet relay datapath | not started |
 | TCP port-forward / SOCKS5 | not started |
 | RP2350 firmware | not started |
 
 A node registered by `lando-host` shows up in the admin console as a real
 machine, gets a tailnet address and a MagicDNS name, and reports *online* for
-as long as the map long-poll is held open. It is not yet reachable — that needs
-the WireGuard data plane.
+as long as the map long-poll is held open. It is not yet reachable: the
+WireGuard and DERP pieces each work, but nothing yet joins them — netmap peers
+do not become WireGuard sessions, and those sessions do not yet route through
+the relay.
 
 ## Layout
 
@@ -123,6 +126,7 @@ tests are the ones with a second opinion:
 
 ```sh
 cargo test                                       # everything
+cargo run -p lando-host -- derp                  # handshake against a real relay
 cargo test -p tailscale-core --test interop_boringtun
 cargo build --target thumbv8m.main-none-eabihf -p tailscale-core   # no_std check
 ```
