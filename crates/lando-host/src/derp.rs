@@ -175,9 +175,6 @@ impl DerpClient {
 
     /// Sends a packet to a peer through the relay.
     ///
-    /// Unused until the WireGuard datapath is wired to the relay; kept here
-    /// because it is the send half of `next_event` and belongs with it.
-    #[allow(dead_code)]
     pub fn send_packet(&mut self, dst: &[u8; KEY_LEN], packet: &[u8]) -> Result<(), Error> {
         let mut payload = Vec::with_capacity(KEY_LEN + packet.len());
         payload.extend_from_slice(dst);

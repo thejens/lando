@@ -23,6 +23,7 @@ pub mod h2;
 pub mod json;
 pub mod key;
 pub mod noise;
+pub mod tsmp;
 pub mod upgrade;
 pub mod wireguard;
 

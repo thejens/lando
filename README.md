@@ -29,15 +29,26 @@ Early. The control-plane path works against the real hosted control plane.
 | WireGuard timers / rekey / cookies | not started |
 | DERP framing + NaCl handshake | working — handshakes with a live relay |
 | DERP packet relay datapath | working — real Tailscale client handshakes over a live relay |
+| TSMP ping/pong | working — `tailscale ping` succeeds |
 | TCP port-forward / SOCKS5 | not started |
 | RP2350 firmware | not started |
 
 A node registered by `lando-host` shows up in the admin console as a real
-machine, gets a tailnet address and a MagicDNS name, and reports *online* for
-as long as the map long-poll is held open. It is not yet reachable: the
-WireGuard and DERP pieces each work, but nothing yet joins them — netmap peers
-do not become WireGuard sessions, and those sessions do not yet route through
-the relay.
+machine, gets a tailnet address and a MagicDNS name, reports *online*, and
+answers `tailscale ping`:
+
+```
+$ tailscale ping 100.64.0.1
+pong from lando (100.64.0.1) via TSMP in 723ms
+```
+
+That round trip is a real Tailscale client reaching this implementation through
+a live DERP relay: WireGuard handshake, session, TSMP decrypted and answered.
+What it cannot do yet is carry TCP, which is what the LAN proxy needs.
+
+**Reachability currently requires Headscale.** Registered against Tailscale's
+hosted control plane the node comes online but peers are never told where to
+reach it — see the protocol notes below.
 
 ## Layout
 

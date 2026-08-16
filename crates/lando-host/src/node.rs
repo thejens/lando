@@ -13,6 +13,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use tailscale_core::key::{NodePrivate, NodePublic};
+use tailscale_core::tsmp;
 use tailscale_core::wireguard::handshake::Responder;
 use tailscale_core::wireguard::peer::Instant;
 use tailscale_core::wireguard::{Peer, Session, MSG_INITIATION, MSG_RESPONSE, MSG_TRANSPORT};
@@ -164,6 +165,23 @@ fn handle_packet(
                 .decrypt(&mut buf)
                 .map_err(|e| format!("decrypt failed: {e:?}"))?;
             describe_inner(plain);
+
+            // `tailscale ping` speaks TSMP rather than ICMP, so answering it is
+            // what makes the node reachable to the standard tooling. Copied out
+            // because the reply is encrypted with the same session that owns
+            // the plaintext borrow.
+            let ping = tsmp::parse_ping(plain);
+            if let Some(ping) = ping {
+                let mut pong = [0u8; 64];
+                let n = tsmp::write_pong(&ping, &mut pong)
+                    .ok_or_else(|| "pong buffer too small".to_string())?;
+                let mut packet = [0u8; 256];
+                let sent = session
+                    .encrypt(&pong[..n], &mut packet)
+                    .map_err(|e| format!("encrypting pong: {e:?}"))?;
+                client.send_packet(src, &packet[..sent])?;
+                println!("  -> TSMP pong");
+            }
             Ok(())
         }
         other => Err(format!("unhandled WireGuard message type {other}")),
