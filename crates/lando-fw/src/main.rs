@@ -230,7 +230,7 @@ fn handle_command(line: &str, pending: &mut Config, store: &mut Store) {
         },
         "derp" => {
             DERP_ENABLED.store(true, core::sync::atomic::Ordering::Relaxed);
-            logln!("derp: enabled; reboot to attempt a relay connection");
+            logln!("derp: enabled; connecting shortly");
         }
         "save" => match store.save(pending) {
             Ok(()) => logln!("saved to flash; reboot to apply"),
@@ -552,7 +552,10 @@ async fn main(spawner: Spawner) {
     // every time is trivially predictable.
     let seed = rand_core::RngCore::next_u64(&mut trng);
 
-    static RESOURCES: StaticCell<embassy_net::StackResources<4>> = StaticCell::new();
+    // One slot per concurrent socket, and DNS needs one of its own. DHCP, the
+    // control channel, the WireGuard UDP socket, the relay and a DNS query is
+    // already five — with four, the next request simply waits forever.
+    static RESOURCES: StaticCell<embassy_net::StackResources<8>> = StaticCell::new();
     let (stack, net_runner) = embassy_net::new(
         net_device,
         embassy_net::Config::dhcpv4(Default::default()),
@@ -682,9 +685,15 @@ async fn main(spawner: Spawner) {
                                     // whole device down before the console can
                                     // be used to recover.
                                     let relay = async {
-                                        if !DERP_ENABLED.load(core::sync::atomic::Ordering::Relaxed)
+                                        // Polled, not checked once: the flag
+                                        // lives in RAM and is set by the
+                                        // console at runtime, so parking
+                                        // forever on the first read would make
+                                        // the command impossible to use.
+                                        while !DERP_ENABLED
+                                            .load(core::sync::atomic::Ordering::Relaxed)
                                         {
-                                            core::future::pending::<()>().await;
+                                            Timer::after(Duration::from_secs(1)).await;
                                         }
                                         match derp::connect(
                                             stack,
