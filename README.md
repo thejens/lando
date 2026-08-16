@@ -30,7 +30,8 @@ Early. The control-plane path works against the real hosted control plane.
 | DERP framing + NaCl handshake | working — handshakes with a live relay |
 | DERP packet relay datapath | working — real Tailscale client handshakes over a live relay |
 | TSMP ping/pong | working — `tailscale ping` succeeds |
-| TCP port-forward / SOCKS5 | not started |
+| TCP over the tunnel (smoltcp) | working |
+| SOCKS5 proxy to the LAN | working — reaches a real LAN device |
 | RP2350 firmware | not started |
 
 A node registered by `lando-host` shows up in the admin console as a real
@@ -44,7 +45,15 @@ pong from lando (100.64.0.1) via TSMP in 723ms
 
 That round trip is a real Tailscale client reaching this implementation through
 a live DERP relay: WireGuard handshake, session, TSMP decrypted and answered.
-What it cannot do yet is carry TCP, which is what the LAN proxy needs.
+It also carries TCP: a SOCKS5 proxy listens on the tunnel address, so any
+tailnet client can reach any host on the LAN the node sits on.
+
+```
+tailnet client ──WireGuard/DERP──▶ lando:1080 (SOCKS5) ──▶ 192.168.x.x:port
+```
+
+Verified end to end against a real UPnP amplifier: `HTTP/1.1 200 OK`, device
+description and all.
 
 **Reachability currently requires Headscale.** Registered against Tailscale's
 hosted control plane the node comes online but peers are never told where to

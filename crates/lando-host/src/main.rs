@@ -8,6 +8,7 @@ mod derp;
 mod node;
 mod state;
 mod transport;
+mod tunnel;
 
 use std::time::Duration;
 
@@ -70,13 +71,14 @@ fn derp_check(state: &State) -> Result<(), String> {
     println!("Listening for relay events (Ctrl-C to stop)...");
     loop {
         match client.next_event()? {
-            derp::Event::Packet { src, data } => {
+            None => {}
+            Some(derp::Event::Packet { src, data }) => {
                 println!("  packet from {} ({} bytes)", hex(&src[..8]), data.len());
             }
-            derp::Event::PeerPresent(k) => println!("  peer present: {}", hex(&k[..8])),
-            derp::Event::PeerGone(k) => println!("  peer gone:    {}", hex(&k[..8])),
-            derp::Event::KeepAlive => println!("  keep-alive"),
-            derp::Event::Other(kind) => println!("  {kind:?}"),
+            Some(derp::Event::PeerPresent(k)) => println!("  peer present: {}", hex(&k[..8])),
+            Some(derp::Event::PeerGone(k)) => println!("  peer gone:    {}", hex(&k[..8])),
+            Some(derp::Event::KeepAlive) => println!("  keep-alive"),
+            Some(derp::Event::Other(kind)) => println!("  {kind:?}"),
         }
     }
 }

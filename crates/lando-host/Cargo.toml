@@ -11,3 +11,4 @@ rand_core = { workspace = true, features = ["getrandom"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 webpki-roots = "1.0.9"
 rustls-pki-types = "1.15.1"
+smoltcp = { version = "0.13", default-features = false, features = ["std", "medium-ip", "proto-ipv4", "socket-tcp", "iface-max-addr-count-2"] }

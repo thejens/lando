@@ -64,6 +64,9 @@ impl DerpClient {
 
         let sock = TcpStream::connect((host, 443))
             .map_err(|e| format!("connecting to {host}:443: {e}"))?;
+        // Generous during setup: the TLS handshake and HTTP upgrade are
+        // round trips that must not be cut short. Shortened below once the
+        // connection is up, where a timeout becomes a useful tick instead.
         sock.set_read_timeout(Some(Duration::from_secs(30)))
             .map_err(|e| e.to_string())?;
         sock.set_nodelay(true).ok();
@@ -84,6 +87,15 @@ impl DerpClient {
         // learns where to reach us, peers see no DERP address, and nothing is
         // ever sent -- silently, with both ends believing they are fine.
         client.note_preferred(true)?;
+
+        // From here a read timeout is the datapath's clock rather than a
+        // failure: the TCP stack must be polled even when no packet arrives,
+        // or a LAN reply sits in a buffer with nothing to move it.
+        client
+            .tls
+            .sock
+            .set_read_timeout(Some(Duration::from_millis(100)))
+            .map_err(|e| format!("setting poll interval: {e}"))?;
         Ok(client)
     }
 
@@ -135,8 +147,24 @@ impl DerpClient {
         }
     }
 
+    /// Reads a frame, retrying past idle ticks until the deadline.
+    ///
+    /// The handshake genuinely expects a reply, so a tick there means "not
+    /// yet" rather than "nothing to do".
+    fn next_frame_blocking(&mut self) -> Result<(FrameType, Vec<u8>), Error> {
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            if let Some(frame) = self.next_raw_frame()? {
+                return Ok(frame);
+            }
+            if std::time::Instant::now() > deadline {
+                return Err("timed out waiting for a relay frame".into());
+            }
+        }
+    }
+
     fn read_server_key(&mut self) -> Result<[u8; KEY_LEN], Error> {
-        match self.next_raw_frame()? {
+        match self.next_frame_blocking()? {
             (FrameType::ServerKey, payload) => {
                 parse_server_key(&payload).map_err(|e| format!("bad ServerKey frame: {e:?}"))
             }
@@ -159,7 +187,7 @@ impl DerpClient {
     }
 
     fn read_server_info(&mut self, node_secret: &[u8; KEY_LEN]) -> Result<Vec<u8>, Error> {
-        let (kind, mut payload) = self.next_raw_frame()?;
+        let (kind, mut payload) = self.next_frame_blocking()?;
         if kind != FrameType::ServerInfo {
             return Err(format!("expected ServerInfo, got {kind:?}"));
         }
@@ -182,11 +210,16 @@ impl DerpClient {
         self.write_frame(FrameType::SendPacket, &payload)
     }
 
-    /// Blocks for the next relay event.
-    pub fn next_event(&mut self) -> Result<Event, Error> {
+    /// Returns the next relay event, or `None` if the read timed out.
+    ///
+    /// A timeout is a tick, not a failure: the caller uses it to advance
+    /// timers and the TCP stack.
+    pub fn next_event(&mut self) -> Result<Option<Event>, Error> {
         loop {
-            let (kind, payload) = self.next_raw_frame()?;
-            return Ok(match kind {
+            let Some((kind, payload)) = self.next_raw_frame()? else {
+                return Ok(None);
+            };
+            return Ok(Some(match kind {
                 FrameType::RecvPacket if payload.len() >= KEY_LEN => {
                     let mut src = [0u8; KEY_LEN];
                     src.copy_from_slice(&payload[..KEY_LEN]);
@@ -207,7 +240,7 @@ impl DerpClient {
                     Event::PeerPresent(k)
                 }
                 other => Event::Other(other),
-            });
+            }));
         }
     }
 
@@ -226,7 +259,7 @@ impl DerpClient {
     ///
     /// The host can afford to assemble; the firmware will consume chunks as
     /// they arrive, which is why the framing itself streams.
-    fn next_raw_frame(&mut self) -> Result<(FrameType, Vec<u8>), Error> {
+    fn next_raw_frame(&mut self) -> Result<Option<(FrameType, Vec<u8>)>, Error> {
         let mut assembled: Vec<u8> = Vec::new();
         loop {
             if self.pos == self.pending.len() {
@@ -244,7 +277,7 @@ impl DerpClient {
                             std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
                         ) =>
                     {
-                        continue
+                        return Ok(None)
                     }
                     Err(e) => return Err(format!("reading from relay: {e}")),
                 };
@@ -262,14 +295,14 @@ impl DerpClient {
             match frame {
                 None => continue,
                 Some(Frame::Control { kind, payload }) => {
-                    return Ok((kind, payload.as_slice().to_vec()))
+                    return Ok(Some((kind, payload.as_slice().to_vec())))
                 }
                 Some(Frame::Body {
                     kind, chunk, end, ..
                 }) => {
                     assembled.extend_from_slice(chunk);
                     if end {
-                        return Ok((kind, assembled));
+                        return Ok(Some((kind, assembled)));
                     }
                 }
             }

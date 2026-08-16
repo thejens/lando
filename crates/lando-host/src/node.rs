@@ -20,6 +20,13 @@ use tailscale_core::wireguard::{Peer, Session, MSG_INITIATION, MSG_RESPONSE, MSG
 
 use crate::derp::{DerpClient, Event};
 use crate::state::hex;
+use crate::tunnel::TunnelStack;
+
+/// Port the SOCKS5 proxy listens on inside the tunnel.
+pub const SOCKS_PORT: u16 = 1080;
+/// Concurrent tunnel connections. smoltcp has no accept queue, so this is a
+/// fixed pool and therefore a hard concurrency limit.
+const SOCKET_POOL: usize = 4;
 
 /// Peers the control plane has told us about, shared with the map-poll thread.
 pub type PeerSet = Arc<Mutex<Vec<NodePublic>>>;
@@ -30,6 +37,15 @@ struct Sessions {
     sessions: HashMap<[u8; 32], Session>,
     /// Our chosen index for each peer, so inbound transport packets demux.
     next_index: u32,
+    /// The TCP stack inside the tunnel, created once our own tunnel address is
+    /// known. That address is learned from the destination of the first packet
+    /// a peer sends us, which avoids threading netmap state down here and is
+    /// correct even for a node holding several addresses.
+    stack: Option<TunnelStack>,
+    /// Peer the tunnel stack's traffic belongs to. Single-peer for now: with
+    /// several, outbound packets would be routed by destination address
+    /// against each peer's allowed IPs.
+    tunnel_peer: Option<[u8; 32]>,
 }
 
 impl Sessions {
@@ -38,6 +54,8 @@ impl Sessions {
             peers: HashMap::new(),
             sessions: HashMap::new(),
             next_index: 1,
+            stack: None,
+            tunnel_peer: None,
         }
     }
 
@@ -70,8 +88,13 @@ pub fn run(
     let mut state = Sessions::new();
 
     loop {
-        match client.next_event()? {
-            Event::Packet { src, data } => {
+        // A tick with no event still advances the TCP stack, which is what
+        // moves a LAN reply back into the tunnel.
+        let event = client.next_event()?;
+        let now = now_millis(started);
+        match event {
+            None => drain_stack(&mut client, &mut state, now)?,
+            Some(Event::Packet { src, data }) => {
                 if let Err(e) = handle_packet(
                     &mut client,
                     &mut state,
@@ -79,15 +102,15 @@ pub fn run(
                     &src,
                     &data,
                     &known_peers,
-                    now_millis(started),
+                    now,
                 ) {
                     println!("  [{}] {e}", hex(&src[..6]));
                 }
             }
-            Event::PeerPresent(k) => println!("  peer present: {}", hex(&k[..6])),
-            Event::PeerGone(k) => println!("  peer gone   : {}", hex(&k[..6])),
-            Event::KeepAlive => {}
-            Event::Other(kind) => println!("  relay frame : {kind:?}"),
+            Some(Event::PeerPresent(k)) => println!("  peer present: {}", hex(&k[..6])),
+            Some(Event::PeerGone(k)) => println!("  peer gone   : {}", hex(&k[..6])),
+            Some(Event::KeepAlive) => {}
+            Some(Event::Other(kind)) => println!("  relay frame : {kind:?}"),
         }
     }
 }
@@ -170,7 +193,14 @@ fn handle_packet(
             // what makes the node reachable to the standard tooling. Copied out
             // because the reply is encrypted with the same session that owns
             // the plaintext borrow.
+            // Hand anything that is not TSMP to the TCP stack. Copied out of
+            // the session buffer because replies re-borrow the same session.
+            let inbound = plain.to_vec();
             let ping = tsmp::parse_ping(plain);
+            if ping.is_none() {
+                feed_stack(client, state, src, &inbound, now)?;
+                return Ok(());
+            }
             if let Some(ping) = ping {
                 let mut pong = [0u8; 64];
                 let n = tsmp::write_pong(&ping, &mut pong)
@@ -186,6 +216,67 @@ fn handle_packet(
         }
         other => Err(format!("unhandled WireGuard message type {other}")),
     }
+}
+
+/// Runs one turn of the TCP stack for a packet that arrived in the tunnel,
+/// then relays whatever the stack wants to send back.
+fn feed_stack(
+    client: &mut DerpClient,
+    state: &mut Sessions,
+    src: &[u8; 32],
+    packet: &[u8],
+    now: Instant,
+) -> Result<(), String> {
+    if packet.len() < 20 || packet[0] >> 4 != 4 {
+        return Ok(());
+    }
+    if state.stack.is_none() {
+        let addr = smoltcp::wire::Ipv4Address::new(packet[16], packet[17], packet[18], packet[19]);
+        println!("  ** tunnel stack listening on {addr}:{SOCKS_PORT}");
+        state.stack = Some(TunnelStack::new(addr, SOCKS_PORT, SOCKET_POOL));
+    }
+    state.tunnel_peer = Some(*src);
+    let stack = state.stack.as_mut().expect("just created");
+    stack.device.push_inbound(packet);
+    drain_stack(client, state, now)
+}
+
+/// Advances the TCP stack and relays whatever it wants to send.
+///
+/// Runs on every tick as well as on inbound packets, because a LAN reply
+/// arrives with no corresponding tunnel packet to trigger it.
+fn drain_stack(
+    client: &mut DerpClient,
+    state: &mut Sessions,
+    now: Instant,
+) -> Result<(), String> {
+    let (Some(stack), Some(peer)) = (state.stack.as_mut(), state.tunnel_peer) else {
+        return Ok(());
+    };
+    stack.poll(now as i64);
+    stack.serve();
+    stack.poll(now as i64);
+    stack.relisten(SOCKS_PORT);
+
+    let mut pending = Vec::new();
+    while let Some(out) = stack.device.pop_outbound() {
+        pending.push(out);
+    }
+    if pending.is_empty() {
+        return Ok(());
+    }
+    let session = state
+        .sessions
+        .get_mut(&peer)
+        .ok_or_else(|| "no session for stack output".to_string())?;
+    for out in pending {
+        let mut packet = vec![0u8; out.len() + 64];
+        let n = session
+            .encrypt(&out, &mut packet)
+            .map_err(|e| format!("encrypting tunnel packet: {e:?}"))?;
+        client.send_packet(&peer, &packet[..n])?;
+    }
+    Ok(())
 }
 
 /// Reports what arrived inside the tunnel, enough to tell a keepalive from
