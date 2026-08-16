@@ -25,8 +25,12 @@ use core::fmt::Write as _;
 use embassy_executor::Spawner;
 use embassy_futures::join::join;
 use embassy_rp::bind_interrupts;
-use embassy_rp::peripherals::USB;
+use embassy_rp::gpio::{Level, Output};
+use embassy_rp::peripherals::{DMA_CH0, PIO0, USB};
+use embassy_rp::pio::{InterruptHandler as PioInterruptHandler, Pio};
 use embassy_rp::usb::{Driver, InterruptHandler};
+use cyw43::{Aligned, A4};
+use cyw43_pio::{PioSpi, RM2_CLOCK_DIVIDER};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::Channel;
 use embassy_time::{Duration, Timer};
@@ -39,7 +43,24 @@ use panic_halt as _;
 
 bind_interrupts!(struct Irqs {
     USBCTRL_IRQ => InterruptHandler<USB>;
+    PIO0_IRQ_0 => PioInterruptHandler<PIO0>;
+    DMA_IRQ_0 => embassy_rp::dma::InterruptHandler<DMA_CH0>;
 });
+
+/// WiFi credentials, baked into the image for now.
+///
+/// A stopgap: the device is meant to be provisioned over USB into a flash
+/// sector, so credentials never sit in a build artifact. Until that exists,
+/// this file is gitignored and the image is treated as sensitive.
+const WIFI_CONFIG: &str = include_str!("../../../.lando-wifi");
+
+fn wifi_credentials() -> (&'static str, &'static str) {
+    let mut lines = WIFI_CONFIG.lines();
+    (
+        lines.next().unwrap_or("").trim(),
+        lines.next().unwrap_or("").trim(),
+    )
+}
 
 /// RP2350 requires a signed image block in flash; without it the bootloader
 /// refuses to run the binary at all.
@@ -62,6 +83,14 @@ macro_rules! logln {
         let _ = $crate::LOGS.try_send(line);
     }};
 }
+
+#[embassy_executor::task]
+async fn cyw43_task(runner: cyw43::Runner<'static, RadioBus>) -> ! {
+    runner.run().await
+}
+
+/// The bus cyw43 talks to the radio over: PIO-driven SPI plus the power pin.
+type RadioBus = cyw43::SpiBus<Output<'static>, PioSpi<'static, PIO0, 0>>;
 
 #[embassy_executor::task]
 async fn usb_task(mut device: embassy_usb::UsbDevice<'static, Driver<'static, USB>>) {
@@ -183,6 +212,50 @@ async fn main(spawner: Spawner) {
             );
         }
         Err(e) => logln!("control key parse failed: {:?}", e),
+    }
+
+    // ---- radio ----
+    // The radio DMAs straight out of these, so they must be 4-byte aligned;
+    // a plain `include_bytes!` has no alignment guarantee at all.
+    static FW: Aligned<A4, [u8; 231077]> =
+        Aligned(*include_bytes!("../cyw43-firmware/43439A0.bin"));
+    static NVRAM: Aligned<A4, [u8; 742]> =
+        Aligned(*include_bytes!("../cyw43-firmware/nvram_rp2040.bin"));
+    let clm = include_bytes!("../cyw43-firmware/43439A0_clm.bin");
+
+    let pwr = Output::new(p.PIN_23, Level::Low);
+    let cs = Output::new(p.PIN_25, Level::High);
+    let mut pio = Pio::new(p.PIO0, Irqs);
+    let spi = PioSpi::new(
+        &mut pio.common,
+        pio.sm0,
+        RM2_CLOCK_DIVIDER,
+        pio.irq0,
+        cs,
+        p.PIN_24,
+        p.PIN_29,
+        embassy_rp::dma::Channel::new(p.DMA_CH0, Irqs),
+    );
+
+    static CYW43_STATE: StaticCell<cyw43::State> = StaticCell::new();
+    let (_net_device, mut control, runner) =
+        cyw43::new(CYW43_STATE.init(cyw43::State::new()), pwr, spi, &FW, &NVRAM).await;
+    spawner.spawn(cyw43_task(runner)).unwrap();
+
+    logln!("radio: loading country/regulatory blob");
+    control.init(clm).await;
+    // Power save adds seconds of latency to inbound packets, which matters for
+    // a device whose whole job is answering them.
+    control
+        .set_power_management(cyw43::PowerManagementMode::None)
+        .await;
+
+    let (ssid, pass) = wifi_credentials();
+    logln!("radio: joining {:?} ({} char key)", ssid, pass.len());
+    let started = embassy_time::Instant::now();
+    match control.join(ssid, cyw43::JoinOptions::new(pass.as_bytes())).await {
+        Ok(_) => logln!("radio: joined in {} ms", started.elapsed().as_millis()),
+        Err(e) => logln!("radio: join failed: {:?}", e),
     }
 
     let mut ticks = 0u32;

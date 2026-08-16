@@ -35,7 +35,7 @@ console:
 # not this repo's MIT, so it is fetched rather than vendored.
 cyw43-firmware:
 	@mkdir -p crates/lando-fw/cyw43-firmware
-	@for f in 43439A0.bin 43439A0_clm.bin LICENSE-permissive-binary-license-1.0.txt; do \
+	@for f in 43439A0.bin 43439A0_clm.bin nvram_rp2040.bin LICENSE-permissive-binary-license-1.0.txt; do \
 	  curl -sL -o crates/lando-fw/cyw43-firmware/$$f \
 	    https://raw.githubusercontent.com/embassy-rs/embassy/main/cyw43-firmware/$$f; \
 	done
