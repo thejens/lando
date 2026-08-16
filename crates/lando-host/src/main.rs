@@ -276,7 +276,10 @@ fn poll_netmap(
             stream: true,
             keep_alive: true,
             omit_peers: false,
-            home_derp,
+            // Deliberately not advertising the legacy 127.3.3.40 pseudo-
+            // endpoint: it is a loopback address, and modern clients report
+            // their relay through Hostinfo.NetInfo.PreferredDERP instead.
+            home_derp: 0,
         },
     )
     .map_err(|e| format!("building MapRequest: {e:?}"))?;
