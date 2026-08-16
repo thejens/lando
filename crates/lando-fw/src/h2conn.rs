@@ -43,6 +43,13 @@ pub struct H2Conn {
     pending: [u8; noise::MAX_MESSAGE_SIZE],
     pending_len: usize,
     pending_pos: usize,
+    /// Ciphertext read from the socket but not yet a complete record.
+    ///
+    /// Records do not align with TCP segments, so a read routinely ends
+    /// mid-record. Holding the tail here — rather than assuming whole records
+    /// arrive together — is what keeps the stream in step.
+    raw: [u8; 2 * noise::MAX_MESSAGE_SIZE],
+    raw_len: usize,
 }
 
 impl H2Conn {
@@ -60,6 +67,8 @@ impl H2Conn {
             pending: [0; noise::MAX_MESSAGE_SIZE],
             pending_len: 0,
             pending_pos: 0,
+            raw: [0; 2 * noise::MAX_MESSAGE_SIZE],
+            raw_len: 0,
         };
 
         let mut buf = [0u8; 128];
@@ -96,67 +105,85 @@ impl H2Conn {
         Ok(())
     }
 
-    /// Decrypts complete records already read from the socket.
-    fn absorb(&mut self, mut bytes: &[u8]) -> Result<(), H2Error> {
-        while bytes.len() >= HEADER_LEN {
-            let header: [u8; HEADER_LEN] = bytes[..HEADER_LEN].try_into().unwrap();
-            let (kind, len) = noise::parse_header(&header);
-            if bytes.len() < HEADER_LEN + len {
-                return Err(H2Error::Frame);
-            }
-            if kind == noise::MSG_TYPE_ERROR {
-                return Err(H2Error::Server);
-            }
-            let mut body = [0u8; noise::MAX_CIPHERTEXT_SIZE];
-            body[..len].copy_from_slice(&bytes[HEADER_LEN..HEADER_LEN + len]);
-            let n = self
-                .session
-                .read_record(&mut body[..len])
-                .map_err(|_| H2Error::Noise)?;
-            if self.pending_len + n > self.pending.len() {
-                return Err(H2Error::TooLarge);
-            }
-            self.pending[self.pending_len..self.pending_len + n].copy_from_slice(&body[..n]);
-            self.pending_len += n;
-            bytes = &bytes[HEADER_LEN + len..];
+    /// Stages ciphertext already read from the socket.
+    fn absorb(&mut self, bytes: &[u8]) -> Result<(), H2Error> {
+        if self.raw_len + bytes.len() > self.raw.len() {
+            return Err(H2Error::TooLarge);
         }
-        Ok(())
+        self.raw[self.raw_len..self.raw_len + bytes.len()].copy_from_slice(bytes);
+        self.raw_len += bytes.len();
+        self.drain_records()
     }
 
-    /// Reads one Noise record and *appends* its plaintext to `pending`.
-    ///
-    /// Appending rather than replacing is essential: the server splits the
-    /// early payload across several records (magic, length, then JSON), so a
-    /// pump that overwrote the buffer would lose the prefix and desynchronise
-    /// everything downstream.
-    async fn pump(&mut self, socket: &mut TcpSocket<'_>) -> Result<(), H2Error> {
-        // Reclaim what has already been consumed before extending.
+    /// Decrypts every complete record in `raw`, leaving any partial tail.
+    fn drain_records(&mut self) -> Result<(), H2Error> {
+        // Reclaim consumed plaintext once, up front, so the room check below
+        // reflects what is actually available.
         if self.pending_pos > 0 {
             self.pending.copy_within(self.pending_pos..self.pending_len, 0);
             self.pending_len -= self.pending_pos;
             self.pending_pos = 0;
         }
-        let mut header = [0u8; HEADER_LEN];
-        read_exact(socket, &mut header).await?;
-        let (kind, len) = noise::parse_header(&header);
-        if len > noise::MAX_CIPHERTEXT_SIZE {
-            return Err(H2Error::TooLarge);
+        let mut pos = 0;
+        while self.raw_len - pos >= HEADER_LEN {
+            let header: [u8; HEADER_LEN] = self.raw[pos..pos + HEADER_LEN].try_into().unwrap();
+            let (kind, len) = noise::parse_header(&header);
+            if len > noise::MAX_CIPHERTEXT_SIZE {
+                return Err(H2Error::TooLarge);
+            }
+            if self.raw_len - pos < HEADER_LEN + len {
+                break; // wait for the rest of this record
+            }
+            if kind == noise::MSG_TYPE_ERROR {
+                return Err(H2Error::Server);
+            }
+            // Leave the record staged if its plaintext will not fit. This is
+            // the backpressure that keeps a 4 KB plaintext buffer workable
+            // against a netmap far larger than it.
+            if self.pending_len + len > self.pending.len() {
+                break;
+            }
+            let mut body = [0u8; noise::MAX_CIPHERTEXT_SIZE];
+            body[..len].copy_from_slice(&self.raw[pos + HEADER_LEN..pos + HEADER_LEN + len]);
+            let n = self
+                .session
+                .read_record(&mut body[..len])
+                .map_err(|_| H2Error::Noise)?;
+
+            self.pending[self.pending_len..self.pending_len + n].copy_from_slice(&body[..n]);
+            self.pending_len += n;
+            pos += HEADER_LEN + len;
         }
-        if kind == noise::MSG_TYPE_ERROR {
-            return Err(H2Error::Server);
-        }
-        let mut body = [0u8; noise::MAX_CIPHERTEXT_SIZE];
-        read_exact(socket, &mut body[..len]).await?;
-        let n = self
-            .session
-            .read_record(&mut body[..len])
-            .map_err(|_| H2Error::Noise)?;
-        if self.pending_len + n > self.pending.len() {
-            return Err(H2Error::TooLarge);
-        }
-        self.pending[self.pending_len..self.pending_len + n].copy_from_slice(&body[..n]);
-        self.pending_len += n;
+        self.raw.copy_within(pos..self.raw_len, 0);
+        self.raw_len -= pos;
         Ok(())
+    }
+
+    /// Reads from the socket until at least one more record is decrypted.
+    async fn pump(&mut self, socket: &mut TcpSocket<'_>) -> Result<(), H2Error> {
+        let before = self.pending_len - self.pending_pos;
+        // Records may already be staged and simply blocked on room.
+        self.drain_records()?;
+        if self.pending_len - self.pending_pos > before {
+            return Ok(());
+        }
+        loop {
+            if self.raw_len == self.raw.len() {
+                return Err(H2Error::TooLarge);
+            }
+            let n = socket
+                .read(&mut self.raw[self.raw_len..])
+                .await
+                .map_err(|_| H2Error::Io)?;
+            if n == 0 {
+                return Err(H2Error::Io);
+            }
+            self.raw_len += n;
+            self.drain_records()?;
+            if self.pending_len - self.pending_pos > before {
+                return Ok(());
+            }
+        }
     }
 
     async fn skip_early_payload(&mut self, socket: &mut TcpSocket<'_>) -> Result<(), H2Error> {
@@ -186,6 +213,30 @@ impl H2Conn {
         body: &[u8],
         out: &mut [u8],
     ) -> Result<usize, H2Error> {
+        let mut written = 0usize;
+        self.post_stream(socket, authority, path, body, |chunk| {
+            let room = out.len().saturating_sub(written);
+            let take = room.min(chunk.len());
+            out[written..written + take].copy_from_slice(&chunk[..take]);
+            written += take;
+        })
+        .await?;
+        Ok(written)
+    }
+
+    /// Issues a POST and hands every response body chunk to `on_data`.
+    ///
+    /// Returns when the server ends the stream — which for a long-poll it
+    /// never does, so this is also the shape the netmap uses: the connection
+    /// stays open and chunks arrive as the tailnet changes.
+    pub async fn post_stream(
+        &mut self,
+        socket: &mut TcpSocket<'_>,
+        authority: &str,
+        path: &str,
+        body: &[u8],
+        mut on_data: impl FnMut(&[u8]),
+    ) -> Result<(), H2Error> {
         let stream_id = self.next_stream;
         self.next_stream += 2;
 
@@ -205,7 +256,6 @@ impl H2Conn {
             self.send(socket, &frame[..n]).await?;
         }
 
-        let mut written = 0usize;
         loop {
             if self.pending_pos == self.pending_len {
                 self.pump(socket).await?;
@@ -238,10 +288,7 @@ impl H2Conn {
                     }
                     Item::Body { header, chunk, end } => {
                         if header.kind == h2::frame_type::DATA && header.stream_id == stream_id {
-                            let room = out.len().saturating_sub(written);
-                            let take = room.min(chunk.len());
-                            out[written..written + take].copy_from_slice(&chunk[..take]);
-                            written += take;
+                            on_data(chunk);
                         }
                         // END_STREAM sits on the frame header, so it reads as
                         // set for every chunk; only the last one ends it.
@@ -265,7 +312,7 @@ impl H2Conn {
                 self.send(socket, &buf[..n]).await?;
             }
             if done {
-                return Ok(written);
+                return Ok(());
             }
         }
     }

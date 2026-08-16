@@ -240,15 +240,12 @@ fn handle_command(line: &str, pending: &mut Config, store: &mut Store) {
 
 /// Registers this node, returning a short status line.
 async fn register(
+    conn: &mut h2conn::H2Conn,
     socket: &mut embassy_net::tcp::TcpSocket<'_>,
-    session: tailscale_core::noise::Session,
-    leftover: &[u8],
     host: &str,
     cfg: &Config,
     node_key: &tailscale_core::key::NodePublic,
 ) -> Result<String<64>, h2conn::H2Error> {
-    let mut conn = h2conn::H2Conn::start(socket, session, leftover).await?;
-
     let hostinfo = tailscale_core::control::Hostinfo {
         hostname: "lando-pico",
         ..Default::default()
@@ -300,6 +297,71 @@ async fn register(
         }
     }
     Ok(status)
+}
+
+/// Holds the netmap long-poll open, which is what makes the node report
+/// online — that status is driven by this poll, not by registration.
+async fn map_poll(
+    conn: &mut h2conn::H2Conn,
+    socket: &mut embassy_net::tcp::TcpSocket<'_>,
+    host: &str,
+    node_key: &tailscale_core::key::NodePublic,
+    disco_key: &tailscale_core::key::DiscoPublic,
+) -> Result<(), h2conn::H2Error> {
+    let hostinfo = tailscale_core::control::Hostinfo {
+        hostname: "lando-pico",
+        preferred_derp: 1,
+        ..Default::default()
+    };
+    let mut body = [0u8; 640];
+    let n = tailscale_core::control::write_map_request(
+        &mut body,
+        &tailscale_core::control::MapRequest {
+            capability_version: tailscale_core::CAPABILITY_VERSION,
+            node_key,
+            disco_key,
+            hostinfo: &hostinfo,
+            stream: true,
+            keep_alive: true,
+            // Peers are dropped for now: the netmap is the largest thing that
+            // arrives here, and nothing on the device consumes peers yet.
+            omit_peers: true,
+            home_derp: 0,
+        },
+    )
+    .map_err(|_| h2conn::H2Error::Frame)?;
+
+    logln!("map: streaming (peers omitted)");
+    let mut frames = tailscale_core::control::MapFrames::new();
+    let mut count = 0u32;
+    let mut current = 0usize;
+    conn.post_stream(
+        socket,
+        host,
+        tailscale_core::control::MAP_PATH,
+        &body[..n],
+        |mut data| {
+            while !data.is_empty() {
+                let (used, frame) = frames.feed(data);
+                if used == 0 && frame.is_none() {
+                    break;
+                }
+                data = &data[used..];
+                let Some(frame) = frame else { continue };
+                if frame.total_len == 0 {
+                    logln!("map: keep-alive");
+                    continue;
+                }
+                current += frame.chunk.len();
+                if frame.end {
+                    count += 1;
+                    logln!("map: frame {} ({} bytes) — node is online", count, current);
+                    current = 0;
+                }
+            }
+        },
+    )
+    .await
 }
 
 #[embassy_executor::main]
@@ -535,21 +597,61 @@ async fn main(spawner: Spawner) {
                 }
                 Ok((mut socket, session, leftover, leftover_len)) => {
                     logln!("control: ts2021 up in {} ms", started.elapsed().as_millis());
-                    match register(
-                        &mut socket,
-                        session,
-                        &leftover[..leftover_len],
-                        host,
-                        &cfg,
-                        &node_key.public(),
-                    )
-                    .await
+                    match h2conn::H2Conn::start(&mut socket, session, &leftover[..leftover_len])
+                        .await
                     {
-                        Ok(text) => {
-                            let _ = core::write!(&mut control_status, "{}", text.as_str());
-                        }
                         Err(e) => {
-                            let _ = core::write!(&mut control_status, "register failed: {:?}", e);
+                            let _ = core::write!(&mut control_status, "h2 failed: {:?}", e);
+                        }
+                        Ok(mut conn) => {
+                            match register(&mut conn, &mut socket, host, &cfg, &node_key.public())
+                                .await
+                            {
+                                Err(e) => {
+                                    let _ =
+                                        core::write!(&mut control_status, "register: {:?}", e);
+                                }
+                                Ok(text) => {
+                                    logln!("control: {}", text.as_str());
+                                    let mut disco = [0u8; 32];
+                                    rand_core::RngCore::fill_bytes(&mut trng, &mut disco);
+                                    let disco =
+                                        tailscale_core::key::DiscoPrivate::from_bytes(disco);
+                                    // A long-poll is quiet by design: the
+                                    // server holds the response open and sends
+                                    // nothing until the tailnet changes. The
+                                    // 20 s idle timeout used for the handshake
+                                    // would abort it during normal operation.
+                                    socket.set_timeout(Some(
+                                        embassy_time::Duration::from_secs(300),
+                                    ));
+                                    // Runs until the connection drops; the node
+                                    // is online for exactly as long as it does.
+                                    match map_poll(
+                                        &mut conn,
+                                        &mut socket,
+                                        host,
+                                        &node_key.public(),
+                                        &disco.public(),
+                                    )
+                                    .await
+                                    {
+                                        Ok(()) => {
+                                            let _ = core::write!(
+                                                &mut control_status,
+                                                "map stream ended"
+                                            );
+                                        }
+                                        Err(e) => {
+                                            let _ = core::write!(
+                                                &mut control_status,
+                                                "map failed: {:?}",
+                                                e
+                                            );
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
                 }
