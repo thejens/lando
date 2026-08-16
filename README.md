@@ -28,7 +28,7 @@ Early. The control-plane path works against the real hosted control plane.
 | WireGuard transport + replay window | working — interops with boringtun |
 | WireGuard timers / rekey / cookies | not started |
 | DERP framing + NaCl handshake | working — handshakes with a live relay |
-| DERP packet relay datapath | not started |
+| DERP packet relay datapath | working — real Tailscale client handshakes over a live relay |
 | TCP port-forward / SOCKS5 | not started |
 | RP2350 firmware | not started |
 
@@ -108,6 +108,17 @@ Some of this is undocumented, so a few findings worth recording:
 - **WireGuard's `mac1` uses BLAKE2s in keyed mode, not HMAC** — while its KDF
   uses HMAC. Swapping them yields handshakes a peer drops without reply, which
   is indistinguishable from a firewall problem.
+- **An unparseable `IPNVersion` silently discards the entire Hostinfo.** No
+  error is returned; the struct simply never appears. Everything inside it goes
+  with it, including the `NetInfo` that tells peers where to reach you.
+- **`derp1.tailscale.com` is not in DERP region 1's mesh.** Region 1's nodes are
+  `derp1i`/`derp1h`. Connect to the wrong one and the relay accepts you,
+  completes its handshake, and then quietly fails to route anything, because
+  peers reach region 1 through servers yours is not meshed with.
+- **Peers are only told where to reach you via `Hostinfo.NetInfo.PreferredDERP`.**
+  Headscale turns that into `Node.HomeDERP`; Tailscale's hosted control plane
+  ignores the identical request, so a node registered there stays unreachable.
+  `Node.DERP` (`127.3.3.40:N`) is the deprecated form of the same thing.
 
 ## Testing
 

@@ -84,10 +84,11 @@ pub struct NoiseTransport {
 }
 
 impl NoiseTransport {
-    /// Connects, performs the HTTP upgrade on port 80 and completes the Noise
+    /// Connects, performs the HTTP upgrade and completes the Noise
     /// IK handshake.
     pub fn connect(
         host: &str,
+        port: u16,
         control_key: &MachinePublic,
         machine_key: MachinePrivate,
         capability_version: u16,
@@ -100,8 +101,8 @@ impl NoiseTransport {
         let req_len = build_request(host, &initiation, &mut request)
             .map_err(|e| format!("building upgrade request: {e:?}"))?;
 
-        let mut stream =
-            TcpStream::connect((host, 80)).map_err(|e| format!("connecting to {host}:80: {e}"))?;
+        let mut stream = TcpStream::connect((host, port))
+            .map_err(|e| format!("connecting to {host}:{port}: {e}"))?;
         stream
             .set_read_timeout(Some(Duration::from_secs(30)))
             .map_err(|e| e.to_string())?;

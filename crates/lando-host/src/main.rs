@@ -122,13 +122,19 @@ fn control_plane(peers_out: Option<node::PeerSet>, home_derp: u32) -> Result<(),
     let host = std::env::var("LANDO_CONTROL_HOST").unwrap_or_else(|_| DEFAULT_CONTROL_HOST.into());
     let key_str = std::env::var("LANDO_CONTROL_KEY").unwrap_or_else(|_| PINNED_CONTROL_KEY.into());
     let hostname = std::env::var("LANDO_HOSTNAME").unwrap_or_else(|_| "lando".into());
+    // Configurable so the client can be pointed at a self-hosted control
+    // server, which is the only way to see both ends of an exchange.
+    let port: u16 = std::env::var("LANDO_CONTROL_PORT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(80);
     let control_key =
         MachinePublic::parse(&key_str).map_err(|e| format!("parsing control key: {e:?}"))?;
 
     let state_path = State::path();
     let (state, fresh) = State::load_or_create(&state_path)?;
 
-    println!("control host : {host}:80  (cleartext — Noise supplies the crypto)");
+    println!("control host : {host}:{port}  (cleartext — Noise supplies the crypto)");
     println!("capver       : {CAPABILITY_VERSION}");
     println!(
         "identity     : {} ({})",
@@ -139,6 +145,7 @@ fn control_plane(peers_out: Option<node::PeerSet>, home_derp: u32) -> Result<(),
 
     let transport = NoiseTransport::connect(
         &host,
+        port,
         &control_key,
         state.machine_key.clone(),
         CAPABILITY_VERSION,
