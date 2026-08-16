@@ -96,7 +96,11 @@ impl Default for Hostinfo<'_> {
     fn default() -> Self {
         Self {
             hostname: "lando",
-            ipn_version: concat!("1.0.0-lando-", env!("CARGO_PKG_VERSION")),
+            // Must parse as a Tailscale version. A string the server cannot
+            // parse gets the *entire* Hostinfo dropped -- silently -- which
+            // costs the NetInfo inside it and with it any home relay, leaving
+            // peers with nowhere to send.
+            ipn_version: "1.98.9",
             os: "linux",
             os_version: "",
             machine: "thumbv8m",

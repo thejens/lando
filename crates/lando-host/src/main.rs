@@ -280,6 +280,9 @@ fn poll_netmap(
         },
     )
     .map_err(|e| format!("building MapRequest: {e:?}"))?;
+    if std::env::var("LANDO_TRACE").is_ok() {
+        eprintln!("MapRequest: {}", String::from_utf8_lossy(&buf[..n]));
+    }
 
     let mut frames = MapFrames::new();
     // The host can afford to assemble a frame before parsing it. The firmware
