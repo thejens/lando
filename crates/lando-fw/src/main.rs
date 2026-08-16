@@ -69,12 +69,20 @@ static IMAGE_DEF: embassy_rp::block::ImageDef = embassy_rp::block::ImageDef::sec
 const CONTROL_KEY: &str =
     "mkey:7d2792f9c98d753d2042471536801949104c247f95eac770f8fb321595e2173b";
 
-/// Relay region this node homes on.
+/// Relay region this node homes on, and a host inside it.
 ///
-/// Stated rather than chosen: picking one needs latency probes across the
-/// whole relay map, and a fixed nearby region costs a few milliseconds
-/// against a measurable amount of flash and airtime.
-const DERP_REGION: u32 = 1;
+/// These two must change together: the number is what peers are told to
+/// reach us through, and the host is what we actually connect to. Naming a
+/// region we are not connected to sends peers to a relay holding no route to
+/// us, which fails silently — traffic is simply dropped with nothing logged
+/// at either end.
+///
+/// Helsinki is the nearest region to Sweden; there is no Nordic region beyond
+/// it, and Frankfurt is the next alternative. Stated rather than measured:
+/// choosing by latency means probing the whole relay map, which costs more
+/// flash and airtime than the few milliseconds it would save.
+const DERP_REGION: u32 = 28;
+const DERP_HOST: &str = "derp28b.tailscale.com";
 
 /// Set by the console's `derp` command.
 static DERP_ENABLED: core::sync::atomic::AtomicBool =
@@ -280,7 +288,7 @@ fn hostinfo<'a>(routes: &'a [&'a str], preferred_derp: u32) -> tailscale_core::c
         // Reported rather than measured. The device has no latency probe, and
         // an absent NetInfo is treated as "nothing known" — which leaves the
         // node with no relay at all, so a stated value is better than silence.
-        derp_latency_ms: Some(50),
+        derp_latency_ms: Some(30),
         working_udp: true,
         ..Default::default()
     }
@@ -854,7 +862,7 @@ async fn main(spawner: Spawner) {
                                         }
                                         match derp::connect(
                                             stack,
-                                            "derp1i.tailscale.com",
+                                            DERP_HOST,
                                             node_key.as_bytes(),
                                             node_key.public().as_bytes(),
                                             &mut trng,
