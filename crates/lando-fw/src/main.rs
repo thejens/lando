@@ -23,6 +23,7 @@
 mod config;
 mod control;
 mod h2conn;
+mod wg;
 
 use core::fmt::Write as _;
 
@@ -307,6 +308,7 @@ async fn map_poll(
     host: &str,
     node_key: &tailscale_core::key::NodePublic,
     disco_key: &tailscale_core::key::DiscoPublic,
+    endpoint: &str,
 ) -> Result<(), h2conn::H2Error> {
     let hostinfo = tailscale_core::control::Hostinfo {
         hostname: "lando-pico",
@@ -326,6 +328,7 @@ async fn map_poll(
             // Peers are dropped for now: the netmap is the largest thing that
             // arrives here, and nothing on the device consumes peers yet.
             omit_peers: true,
+            endpoints: &[endpoint],
             home_derp: 0,
         },
     )
@@ -536,8 +539,12 @@ async fn main(spawner: Spawner) {
     let dhcp_started = embassy_time::Instant::now();
     stack.wait_config_up().await;
     let mut addr: String<64> = String::new();
+    let mut endpoint: String<32> = String::new();
     if let Some(v4) = stack.config_v4() {
         let _ = core::write!(&mut addr, "{}", v4.address);
+        // Advertised so peers can reach us directly. On a LAN this removes
+        // the relay from the path entirely.
+        let _ = core::write!(&mut endpoint, "{}:{}", v4.address.address(), wg::PORT);
     }
     logln!(
         "net: DHCP up in {} ms, address {}",
@@ -627,15 +634,29 @@ async fn main(spawner: Spawner) {
                                     ));
                                     // Runs until the connection drops; the node
                                     // is online for exactly as long as it does.
-                                    match map_poll(
-                                        &mut conn,
-                                        &mut socket,
-                                        host,
-                                        &node_key.public(),
-                                        &disco.public(),
+                                    let mut wg_seed = [0u8; 4];
+                                    rand_core::RngCore::fill_bytes(&mut trng, &mut wg_seed);
+                                    let wg_index = u32::from_le_bytes(wg_seed);
+                                    // Both halves block forever by design: the
+                                    // poll is what keeps the node online, the
+                                    // UDP socket is what makes it reachable.
+                                    let polled = embassy_futures::select::select(
+                                        map_poll(
+                                            &mut conn,
+                                            &mut socket,
+                                            host,
+                                            &node_key.public(),
+                                            &disco.public(),
+                                            endpoint.as_str(),
+                                        ),
+                                        wg::serve(stack, &node_key, wg_index),
                                     )
-                                    .await
-                                    {
+                                    .await;
+                                    let polled = match polled {
+                                        embassy_futures::select::Either::First(r) => r,
+                                        embassy_futures::select::Either::Second(_) => Ok(()),
+                                    };
+                                    match polled {
                                         Ok(()) => {
                                             let _ = core::write!(
                                                 &mut control_status,

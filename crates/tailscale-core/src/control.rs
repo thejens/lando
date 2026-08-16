@@ -215,6 +215,12 @@ pub struct MapRequest<'a> {
     /// Drop peer data. Useful for a first connection where only presence
     /// matters, and a real saving on a device that cannot hold a large netmap.
     pub omit_peers: bool,
+    /// Real endpoints peers can reach us on, as `ip:port` strings.
+    ///
+    /// A peer with a direct endpoint needs no relay at all, which is the
+    /// cheapest way to be reachable on a LAN — and avoids a TLS stack the
+    /// relay path would otherwise require.
+    pub endpoints: &'a [&'a str],
     /// Relay region we are reachable through, or 0 for none.
     ///
     /// **Advertising this is what makes the node reachable at all.** A node
@@ -281,12 +287,17 @@ pub fn write_map_request(out: &mut [u8], req: &MapRequest) -> Result<usize, Json
     if req.omit_peers {
         w.field_bool("OmitPeers", true)?;
     }
-    if req.home_derp != 0 {
-        let mut buf = [0u8; 24];
-        let ep = write_derp_endpoint(req.home_derp, &mut buf);
+    if req.home_derp != 0 || !req.endpoints.is_empty() {
         w.key("Endpoints")?;
         w.begin_array()?;
-        w.str_value(core::str::from_utf8(ep).map_err(|_| JsonError::Malformed)?)?;
+        for ep in req.endpoints {
+            w.str_value(ep)?;
+        }
+        if req.home_derp != 0 {
+            let mut buf = [0u8; 24];
+            let ep = write_derp_endpoint(req.home_derp, &mut buf);
+            w.str_value(core::str::from_utf8(ep).map_err(|_| JsonError::Malformed)?)?;
+        }
         w.end_array()?;
     }
     w.key("Hostinfo")?;
@@ -686,6 +697,7 @@ mod tests {
                 stream: true,
                 keep_alive: true,
                 omit_peers: false,
+                endpoints: &[],
                 home_derp: 0,
             },
         )
@@ -717,6 +729,7 @@ mod tests {
                 stream: true,
                 keep_alive: true,
                 omit_peers: false,
+                endpoints: &[],
                 home_derp: 12,
             },
         )
@@ -739,6 +752,7 @@ mod tests {
                 stream: true,
                 keep_alive: true,
                 omit_peers: false,
+                endpoints: &[],
                 home_derp: 12,
             },
         )

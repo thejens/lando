@@ -39,7 +39,9 @@ Early. The control-plane path works against the real hosted control plane.
 | RP2350 firmware — ts2021 control channel | working — Noise handshake with the real control plane |
 | RP2350 firmware — HTTP/2 + registration | working — the board registers itself as a node |
 | RP2350 firmware — netmap long-poll | working — the board reports **online** |
-| RP2350 firmware — WireGuard / DERP | not started |
+| RP2350 firmware — WireGuard responder (UDP) | implemented, unreachable without disco |
+| disco (endpoint validation) | not started — blocks all direct paths |
+| RP2350 firmware — DERP | not started |
 | USB provisioning to flash | working — image carries no secrets |
 
 A node registered by `lando-host` shows up in the admin console as a real
