@@ -30,6 +30,7 @@ use embassy_rp::bind_interrupts;
 use embassy_rp::gpio::{Level, Output};
 use embassy_rp::peripherals::{DMA_CH0, PIO0, USB};
 use embassy_rp::pio::{InterruptHandler as PioInterruptHandler, Pio};
+use embassy_rp::trng::{InterruptHandler as TrngInterruptHandler, Trng};
 use embassy_rp::usb::{Driver, InterruptHandler};
 use cyw43::{Aligned, A4};
 use cyw43_pio::{PioSpi, RM2_CLOCK_DIVIDER};
@@ -49,6 +50,7 @@ bind_interrupts!(struct Irqs {
     USBCTRL_IRQ => InterruptHandler<USB>;
     PIO0_IRQ_0 => PioInterruptHandler<PIO0>;
     DMA_IRQ_0 => embassy_rp::dma::InterruptHandler<DMA_CH0>;
+    TRNG_IRQ => TrngInterruptHandler<embassy_rp::peripherals::TRNG>;
 });
 
 /// RP2350 requires a signed image block in flash; without it the bootloader
@@ -80,6 +82,13 @@ async fn cyw43_task(runner: cyw43::Runner<'static, RadioBus>) -> ! {
 
 /// The bus cyw43 talks to the radio over: PIO-driven SPI plus the power pin.
 type RadioBus = cyw43::SpiBus<Output<'static>, PioSpi<'static, PIO0, 0>>;
+
+#[embassy_executor::task]
+async fn net_task(
+    mut runner: embassy_net::Runner<'static, cyw43::NetDriver<'static>>,
+) -> ! {
+    runner.run().await
+}
 
 #[embassy_executor::task]
 async fn usb_task(mut device: embassy_usb::UsbDevice<'static, Driver<'static, USB>>) {
@@ -298,7 +307,7 @@ async fn main(spawner: Spawner) {
     );
 
     static CYW43_STATE: StaticCell<cyw43::State> = StaticCell::new();
-    let (_net_device, mut control, runner) =
+    let (net_device, mut control, runner) =
         cyw43::new(CYW43_STATE.init(cyw43::State::new()), pwr, spi, &FW, &NVRAM).await;
     spawner.spawn(cyw43_task(runner)).unwrap();
 
@@ -343,13 +352,42 @@ async fn main(spawner: Spawner) {
     };
     logln!("radio: {}", status);
 
+    // ---- network stack ----
+    // Seed from the RP2350's hardware TRNG rather than a constant: it seeds
+    // TCP initial sequence numbers, and a device that boots with the same
+    // seed every time is trivially predictable.
+    let mut trng = Trng::new(p.TRNG, Irqs, Default::default());
+    let seed = rand_core::RngCore::next_u64(&mut trng);
+
+    static RESOURCES: StaticCell<embassy_net::StackResources<4>> = StaticCell::new();
+    let (stack, net_runner) = embassy_net::new(
+        net_device,
+        embassy_net::Config::dhcpv4(Default::default()),
+        RESOURCES.init(embassy_net::StackResources::new()),
+        seed,
+    );
+    spawner.spawn(net_task(net_runner)).unwrap();
+
+    logln!("net: waiting for DHCP");
+    let dhcp_started = embassy_time::Instant::now();
+    stack.wait_config_up().await;
+    let mut addr: String<64> = String::new();
+    if let Some(v4) = stack.config_v4() {
+        let _ = core::write!(&mut addr, "{}", v4.address);
+    }
+    logln!(
+        "net: DHCP up in {} ms, address {}",
+        dhcp_started.elapsed().as_millis(),
+        addr.as_str()
+    );
+
     // The status rides on every tick rather than being logged once at boot:
     // the host opens the CDC port during enumeration, so anything written
     // before an actual reader attaches is drained into a connection nobody is
     // listening to, and boot-time output is effectively unobservable.
     let mut ticks = 0u32;
     loop {
-        logln!("tick {} — radio: {}", ticks, status);
+        logln!("tick {} — radio: {}, addr {}", ticks, status, addr.as_str());
         ticks = ticks.wrapping_add(1);
         Timer::after(Duration::from_secs(5)).await;
     }
