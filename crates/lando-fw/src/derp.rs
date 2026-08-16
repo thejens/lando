@@ -92,15 +92,28 @@ where
         .await
         .map_err(|_| DerpError::Connect)?;
 
-    let config = TlsConfig::new().with_server_name(host);
+    // RSA signature schemes must be advertised explicitly. TlsConfig::new
+    // only enables them when the `alloc` feature is on, and this is a no_std
+    // build — so without this the ClientHello offers ECDSA and Ed25519 only,
+    // and a server holding an RSA certificate (which the relays do) has
+    // nothing it can sign with and aborts with handshake_failure.
+    let config = TlsConfig::new()
+        .enable_rsa_signatures()
+        .with_server_name(host);
     let mut tls: TlsConnection<_, Aes128GcmSha256> =
         TlsConnection::new(socket, &mut bufs.tls_read, &mut bufs.tls_write);
-    tls.open(TlsContext::new(
-        &config,
-        UnsecureProvider::new::<Aes128GcmSha256>(rng),
-    ))
-    .await
-    .map_err(|_| DerpError::Tls)?;
+    // Log the specific TlsError: collapsing it hides which layer failed, and
+    // "TLS did not work" is not a diagnosis.
+    if let Err(e) = tls
+        .open(TlsContext::new(
+            &config,
+            UnsecureProvider::new::<Aes128GcmSha256>(rng),
+        ))
+        .await
+    {
+        logln!("derp: tls handshake failed: {:?}", e);
+        return Err(DerpError::Tls);
+    }
     logln!("derp: tls up (certificate not verified)");
 
     // Switch the HTTPS connection into the DERP binary protocol.
