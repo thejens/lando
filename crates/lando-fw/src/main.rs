@@ -769,7 +769,13 @@ async fn main(spawner: Spawner) {
     // One slot per concurrent socket, and DNS needs one of its own. DHCP, the
     // control channel, the WireGuard UDP socket, the relay and a DNS query is
     // already five — with four, the next request simply waits forever.
-    static RESOURCES: StaticCell<embassy_net::StackResources<8>> = StaticCell::new();
+    // Sized for the tunnel, which is what consumes these. Long-lived sockets
+    // (control, relay, UDP) take a handful; the rest are the LAN side of
+    // forwarded connections, and a closed one is not immediately reusable, so
+    // the pool has to cover the ones still winding down as well as the ones in
+    // use. Too few does not fail loudly — connections simply stop being
+    // accepted once the pool is dry.
+    static RESOURCES: StaticCell<embassy_net::StackResources<24>> = StaticCell::new();
     let (stack, net_runner) = embassy_net::new(
         net_device,
         embassy_net::Config::dhcpv4(Default::default()),

@@ -46,20 +46,36 @@ use crate::logln;
 /// host for one page, so a short table does not merely slow a page down — it
 /// drops whichever resources arrive after the listeners run out, which renders
 /// as a page with its text but none of its images.
-pub const PORTS: [u16; 14] = [
-    80, 80, 80, 80, 80, 80, 443, 443, 443, 443, 1400, 1400, 37193, 37193,
+/// The count per port is the concurrency limit for that port, exactly: a
+/// connection arriving with no free listener is refused, not queued. Ports are
+/// weighted by how a client actually uses them — a browser opens many
+/// connections to 80 and 443, while a control protocol on 37193 is mostly
+/// sequential but should not fail a burst either.
+pub const PORTS: [u16; 28] = [
+    80, 80, 80, 80, 80, 80, 80, 80, 80, 80, //
+    443, 443, 443, 443, 443, 443, 443, 443, //
+    1400, 1400, 1400, 1400, //
+    37193, 37193, 37193, 37193, 37193, 37193,
 ];
 
-/// Per-socket buffers. Small deliberately: four listeners plus the LAN side
-/// have to coexist in 520 KB alongside a TLS session and the netmap parser.
-const TCP_RX: usize = 1024;
-const TCP_TX: usize = 1024;
+/// Per-socket buffers.
+///
+/// Deliberately small, and traded against listener count: every byte here is
+/// multiplied by [`PORTS`], and a refused connection costs a whole resource
+/// where a small window only costs throughput. This device forwards control
+/// traffic, not bulk transfers.
+const TCP_RX: usize = 768;
+const TCP_TX: usize = 768;
 
 /// Largest IP packet either side will carry.
 const MTU: usize = 1400;
-/// Queue depth each way. Two is enough to absorb a burst without becoming a
-/// buffer that hides backpressure.
-const QUEUE: usize = 2;
+/// Queue depth each way.
+///
+/// This has to absorb a whole burst, because a browser opens its connections
+/// at once and a dropped SYN is not retried for a second or more. Two slots
+/// meant most of a parallel page load was discarded before anything polled the
+/// interface, which looked like the LAN host refusing connections.
+const QUEUE: usize = 12;
 
 type Packet = Vec<u8, MTU>;
 
@@ -163,6 +179,7 @@ pub struct Tunnel {
     /// Sockets a worker is already splicing. Without this two workers pick up
     /// the same connection and copy each other's bytes into it.
     claimed: [bool; PORTS.len()],
+    dropped: u32,
 }
 
 impl Tunnel {
@@ -201,16 +218,27 @@ impl Tunnel {
             sockets,
             listeners,
             claimed: [false; PORTS.len()],
+            dropped: 0,
         }
     }
 
-    /// Queues a decrypted packet from a peer. Dropped if the queue is full;
-    /// TCP treats that as loss and retransmits.
+    /// Queues a decrypted packet from a peer and advances the stack.
+    ///
+    /// Polling here rather than leaving it to the tunnel task is what keeps
+    /// the queue shallow: packets arrive in bursts, and waiting up to a poll
+    /// interval to drain them turns a burst into loss.
     pub fn deliver(&mut self, packet: &[u8]) {
         let mut buf: Packet = Vec::new();
-        if buf.extend_from_slice(packet).is_ok() {
-            let _ = self.device.inbound.push(buf);
+        if buf.extend_from_slice(packet).is_ok() && self.device.inbound.push(buf).is_err() {
+            self.dropped = self.dropped.wrapping_add(1);
         }
+        self.poll(Instant::now());
+    }
+
+    /// Packets dropped for want of queue space, which is otherwise invisible:
+    /// TCP hides it as latency until it becomes total failure.
+    pub fn dropped(&self) -> u32 {
+        self.dropped
     }
 
     /// Takes one packet bound for a peer, ready to encrypt.
@@ -250,6 +278,26 @@ impl Tunnel {
             return Some((i, handle, addr, local.port));
         }
         None
+    }
+
+    /// Counts listeners by state, for diagnosis.
+    ///
+    /// Exhaustion of any pool here is silent — connections simply stop being
+    /// accepted — so the counts have to be observable to be debuggable.
+    pub fn stats(&mut self) -> (usize, usize, usize, u32) {
+        let claimed = self.claimed.iter().filter(|c| **c).count();
+        let mut listening = 0;
+        let mut active = 0;
+        for (handle, _) in self.listeners.clone().iter() {
+            let socket = self.sockets.get_mut::<tcp::Socket>(*handle);
+            if socket.is_listening() {
+                listening += 1;
+            }
+            if socket.is_active() {
+                active += 1;
+            }
+        }
+        (claimed, listening, active, self.dropped)
     }
 
     fn socket(&mut self, handle: SocketHandle) -> &mut tcp::Socket<'static> {
@@ -292,15 +340,48 @@ pub async fn serve(stack: Stack<'static>, tunnel: &crate::TunnelShared) -> ! {
     // is better than discovering it as a stall. Five rather than three because
     // a browser opens around six connections for one page, and a worker is
     // occupied for the whole life of a connection, not just its request.
-    let (a, _, _, _, _) = embassy_futures::join::join5(
-        worker(stack, tunnel),
-        worker(stack, tunnel),
-        worker(stack, tunnel),
-        worker(stack, tunnel),
-        worker(stack, tunnel),
+    // More listeners than workers on purpose. A listener is the only backlog
+    // there is, so a connection with no free listener is refused outright,
+    // where one with no free worker merely waits.
+    let ((a, _, _, _, _), _, _) = embassy_futures::join::join3(
+        embassy_futures::join::join5(
+            worker(stack, tunnel),
+            worker(stack, tunnel),
+            worker(stack, tunnel),
+            worker(stack, tunnel),
+            worker(stack, tunnel),
+        ),
+        embassy_futures::join::join3(
+            worker(stack, tunnel),
+            worker(stack, tunnel),
+            worker(stack, tunnel),
+        ),
+        monitor(tunnel),
     )
     .await;
     a
+}
+
+/// Reports pool occupancy whenever it changes.
+///
+/// Silent exhaustion is the failure mode of every pool here, so this exists to
+/// make it loud.
+async fn monitor(tunnel: &crate::TunnelShared) -> ! {
+    let mut last = (usize::MAX, usize::MAX, usize::MAX, u32::MAX);
+    loop {
+        let now = tunnel.lock(|t| t.borrow_mut().stats());
+        if now != last {
+            logln!(
+                "tunnel: {} busy, {} listening, {} active, {} dropped",
+                now.0,
+                now.1,
+                now.2,
+                now.3
+            );
+            last = now;
+        }
+        Timer::after(Duration::from_millis(250)).await;
+    }
 }
 
 /// Serves one connection at a time.
@@ -343,11 +424,32 @@ async fn splice(
     lan.set_timeout(Some(Duration::from_secs(30)));
 
     let addr = embassy_net::Ipv4Address::from(dst.octets());
-    if lan.connect((addr, port)).await.is_err() {
-        logln!("tunnel: {}:{} unreachable", dst, port);
+    // Distinguish "the LAN host refused us" from "the stack had no socket to
+    // dial with": they look identical from the tailnet side, and only one of
+    // them is a fault in this device.
+    if let Err(e) = lan.connect((addr, port)).await {
+        logln!("tunnel: dial {}:{} failed: {:?}", dst, port, e);
         return;
     }
 
+    let why = relay(tunnel, handle, &mut lan).await;
+    logln!("tunnel: {}:{} ended ({})", dst, port, why);
+
+    // Release the socket rather than letting it wind down on its own. A
+    // gracefully closed socket sits in TIME_WAIT and its slot in the stack's
+    // pool is unavailable until that expires, so a run of requests drains the
+    // pool and later connections are silently never accepted. Flushing first
+    // means nothing already written is discarded by the reset.
+    let _ = embedded_io_async::Write::flush(&mut lan).await;
+    lan.abort();
+}
+
+/// Copies bytes in both directions until either side finishes.
+async fn relay(
+    tunnel: &crate::TunnelShared,
+    handle: SocketHandle,
+    lan: &mut TcpSocket<'_>,
+) -> &'static str {
     let mut buf = [0u8; 512];
     // Bytes read from the LAN that the tailnet socket has not accepted yet.
     // A short write is ordinary flow control — the peer's window is simply
@@ -369,7 +471,7 @@ async fn splice(
             t.poll(Instant::now());
             let socket = t.socket(handle);
             if !socket.is_active() {
-                return (0, true);
+                return (0, 2);
             }
             let n = if socket.can_recv() {
                 socket.recv_slice(&mut buf).unwrap_or(0)
@@ -383,23 +485,25 @@ async fn splice(
             // worker is consumed for good. A handful of requests then exhausts
             // the pool and everything after them hangs.
             let peer_done = !socket.may_recv() && n == 0;
-            (n, peer_done)
+            (n, if !socket.is_active() { 2 } else if peer_done { 1 } else { 0 })
         });
-        if closed {
-            return;
+        if closed == 2 {
+            return "tunnel socket inactive";
+        }
+        if closed == 1 {
+            return "client finished";
         }
         if from_peer > 0 {
             last_activity = Instant::now();
-            if embedded_io_async::Write::write_all(&mut lan, &buf[..from_peer])
+            if embedded_io_async::Write::write_all(&mut *lan, &buf[..from_peer])
                 .await
                 .is_err()
             {
-                return;
+                return "lan write failed";
             }
         }
         if Instant::now() - last_activity > Duration::from_secs(20) {
-            logln!("tunnel: {}:{} idle, closing", dst, port);
-            return;
+            return "idle";
         }
 
         // Drain what is already held before taking more from the LAN, or the
@@ -428,18 +532,22 @@ async fn splice(
         // this loop also owns polling the tailnet stack, so blocking here
         // would stall the path the reply has to travel back along.
         let read = embassy_futures::select::select(
-            embedded_io_async::Read::read(&mut lan, &mut held),
+            embedded_io_async::Read::read(&mut *lan, &mut held),
             Timer::after(Duration::from_millis(10)),
         )
         .await;
         if let embassy_futures::select::Either::First(result) = read {
             match result {
-                Ok(0) | Err(_) => {
+                Ok(0) => {
                     // The LAN host is done. Let the tailnet side flush what it
                     // still holds before tearing the connection down, or the
                     // tail of the response is lost.
                     flush(tunnel, handle).await;
-                    return;
+                    return "lan closed";
+                }
+                Err(_) => {
+                    flush(tunnel, handle).await;
+                    return "lan error";
                 }
                 Ok(n) => {
                     last_activity = Instant::now();
