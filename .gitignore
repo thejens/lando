@@ -5,3 +5,6 @@
 
 # Pre-auth key. A tailnet-joining credential until used or revoked.
 .lando-authkey
+
+# Firmware build output (its own workspace, so its own target dir).
+/crates/lando-fw/target

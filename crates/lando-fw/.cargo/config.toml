@@ -1,0 +1,9 @@
+[build]
+target = "thumbv8m.main-none-eabihf"
+
+[target.thumbv8m.main-none-eabihf]
+# picotool loads straight into a board sitting in BOOTSEL, so no debug probe
+# is required -- which matters here, because there isn't one.
+runner = "picotool load -u -v -x -t elf"
+# Linker arguments come from build.rs; specifying them here as well would
+# process link.x twice.

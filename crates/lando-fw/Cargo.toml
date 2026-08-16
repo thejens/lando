@@ -1,0 +1,31 @@
+[package]
+name = "lando-fw"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Firmware for the Raspberry Pi Pico 2 W."
+
+# Its own workspace: this crate cross-compiles to thumbv8m.main-none-eabihf,
+# and sharing a workspace with the std host crates would mean every `cargo
+# build` at the root tried to build no_std code for the host and vice versa.
+[workspace]
+
+[dependencies]
+tailscale-core = { path = "../tailscale-core" }
+
+embassy-executor = { version = "0.9", features = ["arch-cortex-m", "executor-thread", "executor-interrupt"] }
+embassy-rp = { version = "0.10", features = ["rp235xa", "time-driver", "critical-section-impl"] }
+embassy-time = "0.5"
+embassy-usb-logger = "0.6"
+embassy-futures = "0.1"
+
+cortex-m = { version = "0.7", features = ["inline-asm"] }
+cortex-m-rt = "0.7"
+panic-halt = "1"
+log = "0.4"
+static_cell = "2"
+
+[profile.release]
+opt-level = "z"
+lto = true
+debug = 2
