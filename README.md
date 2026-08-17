@@ -75,10 +75,31 @@ all cross unchanged. Two things decide whether a given app is happy:
   domain. An app that can only find devices by scanning will not find them.
   Nor will a hostname like `device.local` resolve.
 - **Its port must be in `PORTS`.** Ports are preallocated, so anything not
-  listed is simply not routed. Check what the device actually listens on rather
-  than assuming — the Lyngdorf amplifier this was built for serves its web UI
-  and WebSocket on `80`, UPnP on `37193`, and takes its app's control protocol
-  on `84`.
+  listed is simply not routed. Read what the device advertises over mDNS rather
+  than guessing — `dns-sd -Z _spotify-connect._tcp local` names both the port
+  and the path. The amplifier this was built for turned out to use six:
+
+  | | |
+  |---|---|
+  | `80` | web UI, and a WebSocket its vendor app upgrades to |
+  | `84` | the vendor app's raw control protocol |
+  | `8080` | Spotify Connect zeroconf, `/api/stream/spotify:zeroconf` |
+  | `8008` / `8009` | Google Cast, HTTP and protobuf-over-TLS |
+  | `37193` | UPnP/DLNA |
+
+**What routing a port does not buy you.** Two cases are worth understanding
+before assuming a protocol will work:
+
+- **Spotify Connect needs the LAN only to pair.** Once a speaker has been handed
+  credentials it holds its own connection to Spotify and is controlled through
+  Spotify's servers — so it is already reachable from anywhere, with or without
+  this device. What the tunnel adds is pairing a speaker remotely.
+- **Google Cast is the opposite.** Its control channel is reachable, but clients
+  find devices exclusively over mDNS, so an app that can only discover will
+  never see it however many ports are open.
+- **AirPlay is not routed at all.** Its control channel is TCP but its audio and
+  timing are UDP/RTP, so routing the control port would negotiate a session that
+  then plays nothing — worse than failing to connect.
 
 Long-lived idle connections are fine: a WebSocket held open for a minute with no
 traffic survives, which is the normal state of a control channel between
