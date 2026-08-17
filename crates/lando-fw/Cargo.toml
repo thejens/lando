@@ -34,6 +34,9 @@ smoltcp = { version = "0.13", default-features = false, features = [
     "medium-ip",
     "proto-ipv4",
     "socket-tcp",
+    # UDP carries the mDNS relay: a query arriving over the tunnel is re-asked
+    # on the LAN, and the answers come back the same way.
+    "socket-udp",
     "iface-max-addr-count-1",
 ] }
 embassy-sync = "0.7"

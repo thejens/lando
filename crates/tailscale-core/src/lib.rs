@@ -23,6 +23,7 @@ pub mod disco;
 pub mod h2;
 pub mod json;
 pub mod key;
+pub mod mdns;
 pub mod noise;
 pub mod tsmp;
 pub mod upgrade;

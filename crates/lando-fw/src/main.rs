@@ -24,6 +24,7 @@ mod config;
 mod control;
 mod derp;
 mod h2conn;
+mod mdns;
 mod tunnel;
 mod wg;
 
@@ -1029,7 +1030,10 @@ async fn main(spawner: Spawner) {
                                     ),
                                     wg::serve(stack, &node, &tunnel),
                                     relay,
-                                    tunnel::serve(stack, &tunnel),
+                                    embassy_futures::join::join(
+                                        tunnel::serve(stack, &tunnel),
+                                        mdns::serve(stack, &tunnel),
+                                    ),
                                 )
                                 .await;
                                 let polled = match polled {

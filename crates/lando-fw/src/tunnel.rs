@@ -27,7 +27,7 @@ use embassy_time::{Duration, Instant, Timer};
 use heapless::Vec;
 use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet, SocketStorage};
 use smoltcp::phy::{Device, DeviceCapabilities, Medium};
-use smoltcp::socket::tcp;
+use smoltcp::socket::{tcp, udp};
 use smoltcp::time::Instant as SmolInstant;
 use smoltcp::wire::{HardwareAddress, IpAddress, Ipv4Address};
 
@@ -181,6 +181,14 @@ impl Device for TunnelDevice {
     }
 }
 
+/// Datagrams the mDNS relay can hold each way.
+///
+/// Sized for a browse rather than for a query: enumerating a LAN draws an
+/// answer from every responder on it, arriving together, and a queue that
+/// cannot hold them silently drops the difference — the client sees a partial
+/// LAN and no indication that anything is missing.
+const MDNS_QUEUE: usize = 12;
+
 /// Storage for the socket set, which smoltcp requires to outlive the interface.
 ///
 /// Reached through [`storage`] rather than constructed by a caller: at this
@@ -188,17 +196,26 @@ impl Device for TunnelDevice {
 /// what a `StaticCell` would require. The symptom of trying is not a compile
 /// error but a device that stops partway through boot.
 pub struct Storage {
-    sockets: [SocketStorage<'static>; PORTS.len()],
+    // One extra slot beyond the TCP listeners, for the mDNS socket.
+    sockets: [SocketStorage<'static>; PORTS.len() + 1],
     rx: [[u8; TCP_RX]; PORTS.len()],
     tx: [[u8; TCP_TX]; PORTS.len()],
+    mdns_rx_meta: [udp::PacketMetadata; MDNS_QUEUE],
+    mdns_rx: [u8; 2048],
+    mdns_tx_meta: [udp::PacketMetadata; MDNS_QUEUE],
+    mdns_tx: [u8; 4096],
 }
 
 impl Storage {
     const fn new() -> Self {
         Self {
-            sockets: [SocketStorage::EMPTY; PORTS.len()],
+            sockets: [SocketStorage::EMPTY; PORTS.len() + 1],
             rx: [[0; TCP_RX]; PORTS.len()],
             tx: [[0; TCP_TX]; PORTS.len()],
+            mdns_rx_meta: [udp::PacketMetadata::EMPTY; MDNS_QUEUE],
+            mdns_rx: [0; 2048],
+            mdns_tx_meta: [udp::PacketMetadata::EMPTY; MDNS_QUEUE],
+            mdns_tx: [0; 4096],
         }
     }
 }
@@ -227,6 +244,10 @@ pub struct Tunnel {
     /// the same connection and copy each other's bytes into it.
     claimed: [bool; PORTS.len()],
     dropped: u32,
+    /// Where discovery queries arrive. Bound on the tunnel rather than the LAN
+    /// because it answers *for* the LAN: a client addresses this node, and the
+    /// relay asks the LAN on its behalf.
+    mdns: SocketHandle,
 }
 
 impl Tunnel {
@@ -259,6 +280,19 @@ impl Tunnel {
             }
         }
 
+        let mdns_socket = udp::Socket::new(
+            udp::PacketBuffer::new(&mut storage.mdns_rx_meta[..], &mut storage.mdns_rx[..]),
+            udp::PacketBuffer::new(&mut storage.mdns_tx_meta[..], &mut storage.mdns_tx[..]),
+        );
+        let mdns = sockets.add(mdns_socket);
+        if sockets
+            .get_mut::<udp::Socket>(mdns)
+            .bind(tailscale_core::mdns::PORT)
+            .is_err()
+        {
+            logln!("tunnel: could not bind mdns port");
+        }
+
         Self {
             device,
             iface,
@@ -266,7 +300,40 @@ impl Tunnel {
             listeners,
             claimed: [false; PORTS.len()],
             dropped: 0,
+            mdns,
         }
+    }
+
+    /// Takes one pending discovery query, with everything needed to answer it.
+    ///
+    /// The metadata is carried whole rather than reduced to the client's
+    /// address, because it also records which of our addresses the query was
+    /// sent to. This interface has no address of its own — AnyIP accepts every
+    /// destination — so that field is the only thing that can tell a reply
+    /// where to claim it came from. Without it smoltcp has no source address
+    /// to choose and the answer is never sent, which looks from the client's
+    /// side exactly like the LAN having nothing to say.
+    pub fn take_mdns_query(&mut self, out: &mut [u8]) -> Option<(usize, udp::UdpMetadata)> {
+        self.poll(Instant::now());
+        let socket = self.sockets.get_mut::<udp::Socket>(self.mdns);
+        if !socket.can_recv() {
+            return None;
+        }
+        let (data, meta) = socket.recv().ok()?;
+        let len = data.len().min(out.len());
+        out[..len].copy_from_slice(&data[..len]);
+        Some((len, meta))
+    }
+
+    /// Sends one relayed answer back to the client that asked.
+    ///
+    /// The query's metadata is reused unchanged: on an outgoing datagram the
+    /// same two fields mean "send it there" and "send it from here", which is
+    /// exactly the reply this needs.
+    pub fn send_mdns_answer(&mut self, answer: &[u8], client: udp::UdpMetadata) {
+        let socket = self.sockets.get_mut::<udp::Socket>(self.mdns);
+        let _ = socket.send_slice(answer, client);
+        self.poll(Instant::now());
     }
 
     /// Queues a decrypted packet from a peer and advances the stack.
