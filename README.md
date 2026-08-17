@@ -70,10 +70,9 @@ Vendor apps generally work, because the tunnel forwards bytes and never parses
 them — a WebSocket upgrade, a raw control protocol on an odd port, or UPnP SOAP
 all cross unchanged. Two things decide whether a given app is happy:
 
-- **It must let you enter an address.** Discovery does not cross the tunnel:
-  mDNS and SSDP are both UDP multicast, and a tailnet is not a multicast
-  domain. An app that can only find devices by scanning will not find them.
-  Nor will a hostname like `device.local` resolve.
+- **It must let you enter an address.** An app that can only find devices by
+  browsing will not find them, and a `device.local` hostname will not resolve.
+  See [Discovery](#discovery) for what can be done about that and what cannot.
 - **Its port must be in `PORTS`.** Ports are preallocated, so anything not
   listed is simply not routed. Read what the device advertises over mDNS rather
   than guessing — `dns-sd -Z _spotify-connect._tcp local` names both the port
@@ -109,6 +108,36 @@ commands.
 port — smoltcp has no accept queue, so a connection arriving with none free is
 refused rather than queued. One peer at a time. DERP certificates are not
 verified (see [Caveats](#caveats)).
+
+## Discovery
+
+The device answers mDNS on behalf of its LAN, so services on it can be
+enumerated from anywhere on the tailnet:
+
+```sh
+dig @lando-pico -p 5353 _services._dns-sd._udp.local PTR
+```
+
+That returns the service types on the far LAN; browsing one and resolving the
+result gives a host and port to connect to. In one house it found 22 types —
+Spotify Connect, Google Cast, AirPlay, Matter, Tidal, and a lighting system —
+and resolved the amplifier's own control protocol to `tdai1120.local:84`, which
+is exactly the address its vendor app uses.
+
+**It has to be asked directly, and that is not a shortcut.** Three separate
+things stop a client's ordinary browse from reaching this device, and only the
+first is Tailscale's:
+
+1. A tailnet carries no multicast, and mDNS is multicast to `224.0.0.251`.
+2. The client's resolver would not send it there anyway — `224.0.0.251` routes
+   to the physical link, not the tunnel.
+3. `.local` is reserved for link-local multicast in every mainstream resolver,
+   so it cannot be pointed at a unicast server either.
+
+So a phone's Cast or AirPlay browse will never arrive, and no amount of work
+here changes that. What does work is anything that can be handed an address: a
+script, a home-automation server, `dig`. That is the ceiling — but it is the
+difference between finding nothing and listing everything.
 
 ## Layout
 
