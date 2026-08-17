@@ -1,145 +1,152 @@
 # lando
 
-A from-scratch Tailscale client for the Raspberry Pi Pico 2 W, in Rust. No
-Tailscale daemon, no Go runtime, no Linux — the wire protocol on bare metal, in
-392 KB of the RP2350's 512 KB of SRAM.
+**Reach everything on your home network from anywhere — with nothing exposed to
+the internet, and nothing to pay for.**
 
-Plug the board into any network, configure it once over USB, and every device on
-that LAN becomes reachable from your tailnet.
+Plug a $7 microcontroller into a spare USB charger. Configure it once. From then
+on your phone on cellular, or your laptop at work, can talk to your amplifier,
+your router's admin page, your speakers — every device on that network — exactly
+as if you were sitting at home.
 
 ```
-phone on 5G ──WireGuard──▶ DERP relay ──▶ Pico ──▶ 192.168.1.50:37193
-                                                   any host on its LAN
+phone on 5G ──encrypted──▶ relay ──▶ lando ──▶ 192.168.1.50
+                                               anything on the LAN
 ```
 
-## Why this is useful
+## Why you'd want this
 
-Reaching a device on a home LAN from outside normally costs you one of these: a
-port forward, a dynamic-DNS record, a VPN server to run and patch, or a cloud
-relay you rent. Each is a permanent thing to maintain, and the first two put your
-network on the public internet.
+Getting at a device on your home network from outside normally costs you one of
+these:
 
-lando is a $7 board that removes all of them. It joins your tailnet as an
-ordinary node and advertises its LAN as a subnet route, so from anywhere you
-just address LAN hosts directly:
+| The usual way | What it costs you |
+|---|---|
+| Port forwarding | Your device is now on the public internet, being scanned |
+| Dynamic DNS | Another account, another thing that silently expires |
+| A VPN server | A machine to run, patch, and keep running |
+| A vendor's cloud | A subscription, and your data through someone else's servers |
+| A Raspberry Pi | 10× the price, an SD card that will corrupt itself, an OS to maintain |
+
+lando is none of them. It joins your private Tailscale network as an ordinary
+device and quietly bridges the rest of your home onto it.
+
+- **Nothing is exposed.** Every connection it makes is outbound. Your router is
+  never touched, no ports are opened, and there is nothing on the public
+  internet to find or attack.
+- **Nothing to run.** No server, no container, no account beyond Tailscale's
+  free tier. It is a sealed device that boots in five seconds and stays up.
+- **Nothing to configure per device.** It advertises your whole network, so you
+  use the same addresses you already use at home — no per-device tunnels, no
+  port-forward table to maintain.
+- **It sips power.** A microcontroller on a phone charger, not a computer in a
+  cupboard.
+- **Your traffic stays yours.** Encrypted end to end between your phone and this
+  device, authenticated by your own network's identity. No vendor in the middle.
+
+It replaces an earlier version of this project that did the same job by holding a
+connection open to a Cloudflare Worker — a hosted dependency, a second codebase,
+and somewhere a device credential had to live. A private network already solves
+identity, encryption and getting through your router, so none of that needs to
+exist.
+
+## What you can actually do with it
+
+Once it is on your network, from anywhere in the world:
 
 ```sh
-curl http://192.168.1.50:37193/description.xml    # from a phone on cellular
+# your router's admin page, from a phone on cellular
+open http://192.168.1.1/
+
+# your amplifier's API, its vendor app, its web interface
+curl http://192.168.1.50:8080/...
+
+# and find out what is even on the network, without being on it
+dig @lando -p 5353 _services._dns-sd._udp.local PTR
 ```
 
-Every connection is end-to-end WireGuard, authenticated by your tailnet's
-identity, and every connection is outbound — nothing about your network is
-exposed, and the router is never touched.
+That last one matters more than it looks: normally nothing outside your home can
+enumerate what is inside it. lando answers discovery on behalf of the network. In
+one house it found 22 kinds of service — Spotify Connect, Google Cast, AirPlay,
+Matter, a lighting system — and resolved the amplifier's own control protocol to
+the exact host and port its app uses.
 
-It grew out of an earlier project that did the same job by parking an outbound
-WebSocket at a Cloudflare Worker. That Worker was a permanent hosted dependency,
-a second codebase to keep in sync, and a place where a device credential lived.
-A tailnet already solves NAT traversal, identity, key exchange and transport
-encryption, so none of it needs to exist.
+Vendor apps generally work, including ones that hold a connection open for hours
+between commands. Two things decide whether a given app is happy, and both are
+checkable in advance — see below.
 
-It is also, as far as I can tell, the smallest complete Tailscale node there is:
-control plane, WireGuard, disco, DERP and a TCP proxy in a microcontroller with
-no MMU, no allocator and no operating system.
+## Limits
 
-## What works
+Stated plainly, because the shape of what this cannot do is as useful as what it
+can.
 
-Running on hardware against Tailscale's real hosted control plane:
-
-| | |
-|---|---|
-| Registers as a real node | tailnet IP, MagicDNS name, reports online |
-| Reachable behind NAT | holds a DERP relay connection open, reconnects with backoff |
-| Direct paths | disco endpoint validation, `tailscale ping` in ~39 ms on-LAN |
-| Subnet router | advertises and routes its whole LAN over the tailnet |
-| Provisioning | WiFi and tailnet credentials over USB; the image carries no secrets |
-
-Measured, fetching a 172 KB file through the tunnel, byte-identical each time:
-
-```
-direct path    2.8 s   (61 KB/s)
-via DERP       8.4 s   (20 KB/s)
-```
-
-The relay figure is dominated by per-packet cost — WireGuard and TLS are both in
-software on a 150 MHz core. It is comfortable for controlling things and poor for
-moving bulk data, which is the intended trade.
-
-### Using it with a device's own app
-
-Vendor apps generally work, because the tunnel forwards bytes and never parses
-them — a WebSocket upgrade, a raw control protocol on an odd port, or UPnP SOAP
-all cross unchanged. Two things decide whether a given app is happy:
-
-- **It must let you enter an address.** An app that can only find devices by
-  browsing will not find them, and a `device.local` hostname will not resolve.
-  See [Discovery](#discovery) for what can be done about that and what cannot.
-- **Its port must be in `PORTS`.** Ports are preallocated, so anything not
-  listed is simply not routed. Read what the device advertises over mDNS rather
-  than guessing — `dns-sd -Z _spotify-connect._tcp local` names both the port
-  and the path. The amplifier this was built for turned out to use six:
-
-  | | |
-  |---|---|
-  | `80` | web UI, and a WebSocket its vendor app upgrades to |
-  | `84` | the vendor app's raw control protocol |
-  | `8080` | Spotify Connect zeroconf, `/api/stream/spotify:zeroconf` |
-  | `8008` / `8009` | Google Cast, HTTP and protobuf-over-TLS |
-  | `37193` | UPnP/DLNA |
-
-**What routing a port does not buy you.** Two cases are worth understanding
-before assuming a protocol will work:
-
-- **Spotify Connect needs the LAN only to pair.** Once a speaker has been handed
-  credentials it holds its own connection to Spotify and is controlled through
-  Spotify's servers — so it is already reachable from anywhere, with or without
-  this device. What the tunnel adds is pairing a speaker remotely.
-- **Google Cast is the opposite.** Its control channel is reachable, but clients
-  find devices exclusively over mDNS, so an app that can only discover will
-  never see it however many ports are open.
-- **AirPlay is not routed at all.** Its control channel is TCP but its audio and
-  timing are UDP/RTP, so routing the control port would negotiate a session that
-  then plays nothing — worse than failing to connect.
-
-Long-lived idle connections are fine: a WebSocket held open for a minute with no
-traffic survives, which is the normal state of a control channel between
-commands.
-
-**Other limits.** The listener count per port is the concurrency limit for that
-port — smoltcp has no accept queue, so a connection arriving with none free is
-refused rather than queued. One peer at a time. DERP certificates are not
-verified (see [Caveats](#caveats)).
+- **Your app must let you type an address.** Discovery works, but only when
+  something asks for it. An app that can only *browse* for devices — the Google
+  Home app, most Cast and AirPlay clients — will not find anything, and no
+  amount of work here changes that. See [Discovery](#discovery).
+- **TCP only.** Protocols that carry audio over UDP, AirPlay among them, do not
+  cross.
+- **Ports are declared, not discovered.** Only listed ports are bridged, and the
+  number of listeners on a port is how many connections it can carry at once.
+  Currently routed: `80`, `84`, `443`, `8008`, `8009`, `8080`, `37193`. Adding
+  one is a single line.
+- **One person at a time.** It serves a single peer, not a household.
+- **Fast enough to control things, not to move files.** Measured on a 172 KB
+  download: 2.8 s over a direct path, 8.4 s via a relay. Every byte is encrypted
+  twice, in software, on a 150 MHz chip.
+- **It is a hobby project.** It speaks an interface Tailscale treats as internal
+  and does not promise to keep stable. It works, it is tested against the real
+  thing, and it will occasionally need updating when that changes.
 
 ## Discovery
 
-The device answers mDNS on behalf of its LAN, so services on it can be
-enumerated from anywhere on the tailnet:
-
 ```sh
-dig @lando-pico -p 5353 _services._dns-sd._udp.local PTR
+dig @lando -p 5353 _services._dns-sd._udp.local PTR
 ```
 
-That returns the service types on the far LAN; browsing one and resolving the
-result gives a host and port to connect to. In one house it found 22 types —
-Spotify Connect, Google Cast, AirPlay, Matter, Tidal, and a lighting system —
-and resolved the amplifier's own control protocol to `tdai1120.local:84`, which
-is exactly the address its vendor app uses.
+That lists the service types on the far network; browsing one and resolving it
+gives a host and port to connect to.
 
-**It has to be asked directly, and that is not a shortcut.** Three separate
-things stop a client's ordinary browse from reaching this device, and only the
-first is Tailscale's:
+**It has to be asked directly, and that is a hard limit rather than a shortcut.**
+Three separate things stop an ordinary browse from reaching this device, and only
+the first is Tailscale's:
 
-1. A tailnet carries no multicast, and mDNS is multicast to `224.0.0.251`.
-2. The client's resolver would not send it there anyway — `224.0.0.251` routes
-   to the physical link, not the tunnel.
-3. `.local` is reserved for link-local multicast in every mainstream resolver,
-   so it cannot be pointed at a unicast server either.
+1. A private network like this carries no multicast, and discovery is multicast.
+2. Your phone would not send it there anyway — multicast goes out over the local
+   wireless link, not the tunnel.
+3. `.local` names are reserved for local-link discovery in every mainstream
+   operating system, so they cannot be pointed at a remote server either.
 
-So a phone's Cast or AirPlay browse will never arrive, and no amount of work
-here changes that. What does work is anything that can be handed an address: a
-script, a home-automation server, `dig`. That is the ceiling — but it is the
-difference between finding nothing and listing everything.
+So a phone's Cast browse will never arrive here. What does work is anything that
+can be handed an address: a script, a home-automation server, `dig`. That is the
+ceiling — but it is the difference between finding nothing and listing
+everything.
 
-## Layout
+## Getting one running
+
+You need a Raspberry Pi Pico 2 W, a USB cable, and a free Tailscale account.
+
+```sh
+make cyw43-firmware    # wireless firmware, fetched rather than bundled
+make flash             # builds and flashes over USB
+make console           # talk to it
+```
+
+In the console set `ssid`, `pass` and `key` (a Tailscale pre-auth key), then
+`save`. Credentials live in their own area of flash and never in the firmware
+image, so every board runs byte-identical code and the image carries no secrets.
+`show` prints the configuration and `clear` erases it.
+
+Then approve its route in the Tailscale admin console, and it is done.
+Reflashing never needs anyone to touch the board — it takes `b` on its console
+as "hand yourself back to the bootloader".
+
+## For developers
+
+No Tailscale daemon, no Go runtime, no operating system: the wire protocol
+implemented from scratch on bare metal, in 416 KB of the chip's 512 KB of RAM.
+As far as I can tell it is the smallest complete Tailscale node there is —
+control plane, WireGuard, endpoint discovery, relay support and a TCP proxy on a
+microcontroller with no memory management unit, no allocator, and nothing
+underneath it.
 
 ```
 crates/tailscale-core/   no_std, sans-IO. Protocol state machines, zero I/O.
@@ -149,96 +156,69 @@ crates/lando-fw/         no_std firmware for the Pico 2 W.
 
 `tailscale-core` never touches a socket, a clock or an allocator, so the *same
 compiled logic* runs under a debugger on a laptop and on a board that has
-neither a debugger nor an OS. That split is the reason this was tractable: the
-board has USB CDC logging and nothing else, and bare metal is a bad place to
-discover that a length prefix is little-endian.
+neither a debugger nor an OS. That split is why this was tractable: the board has
+a USB serial log and nothing else, and bare metal is a bad place to discover that
+a length prefix is little-endian.
 
-## Try it
-
-On a laptop, no hardware required:
+Run it on a laptop, no hardware required:
 
 ```sh
 cargo test
-echo 'tskey-auth-...' > .lando-authkey     # or omit for interactive login
+echo 'tskey-auth-...' > .lando-authkey    # or omit, for interactive login
 cargo run -p lando-host
 ```
 
-The node appears in your admin console. `LANDO_TRACE=1` dumps the HTTP/2
-exchange — everything on the wire is inside Noise, so a packet capture shows
-only ciphertext and this is the only way to watch the protocol.
+`LANDO_TRACE=1` dumps the HTTP/2 exchange. Everything on the wire is inside
+Noise, so a packet capture shows only ciphertext — this is the only way to watch
+the protocol.
 
-On hardware:
-
-```sh
-make cyw43-firmware    # radio blobs, fetched rather than vendored
-make flash             # reboots the board into its bootloader, then flashes
-make console           # USB serial console
-```
-
-In the console, set `ssid`, `pass` and `key` (a tailnet pre-auth key), then
-`save`. Credentials live in their own flash sector and never in the image, so
-every board runs byte-identical firmware. `show` prints the current config and
-`clear` erases it.
-
-`make flash` works without anyone touching the board: the running firmware takes
-`b` on its console as "hand yourself back to the bootloader". Without that, every
-reflash needs a human holding BOOTSEL while replugging.
-
-## Notes on the protocol
+### Notes on the protocol
 
 Tailscale treats this interface as internal and does not document it. The
-findings that cost the most to establish, in case they save someone else the
-time:
+findings that cost the most to establish:
 
 - **The control channel needs no TLS.** `POST /ts2021` on **port 80**, in the
-  clear, Noise initiation base64'd into `X-Tailscale-Handshake`. Noise supplies
+  clear, with the Noise handshake base64'd into a header. Noise supplies
   confidentiality and authentication on top. This is what makes a client on a
   microcontroller tractable at all.
 - **A streaming `MapRequest` is read-only.** With `Stream: true` and
-  `Version >= 68` the server ignores `Hostinfo` and `Endpoints` entirely. A
-  client that only long-polls goes *online* and yet publishes no endpoints, no
+  `Version >= 68` the server ignores `Hostinfo` and `Endpoints` entirely, so a
+  client that only long-polls goes *online* while publishing no endpoints, no
   relay and no connectivity data — with no error anywhere. Send those on a
-  separate one-shot request (`Stream: false`, `OmitPeers: true`).
+  separate one-shot request.
 - **An early payload precedes HTTP/2.** After the handshake the server sends
-  `\xff\xff\xffTS`, a 4-byte big-endian length, then JSON. Feed it to an HTTP/2
-  parser and the connection desynchronises and hangs forever.
-- **The record nonce is big-endian**, though Noise specifies little-endian. And
-  WireGuard, using the same cipher and nonce layout, counts little-endian. The
-  netmap's length prefix is little-endian too, while every other length on the
-  control connection is big-endian.
-- **An unparseable `IPNVersion` silently discards the whole `Hostinfo`.** No
-  error; the struct simply never appears, and everything in it goes too.
-- **disco is not optional.** A peer will not send WireGuard to an endpoint it
-  has not validated with a disco pong, so a node that cannot answer disco is
-  unreachable on every direct path regardless of its netmap. The symptom is
-  silence at both ends.
+  `\xff\xff\xffTS`, a big-endian length, then JSON. Feed it to an HTTP/2 parser
+  and the connection desynchronises and hangs forever.
+- **The record nonce is big-endian**, though Noise specifies little-endian — and
+  WireGuard, with the same cipher and nonce layout, counts little-endian.
+- **An unparseable `IPNVersion` silently discards the whole `Hostinfo`.**
+- **Endpoint discovery is not optional.** A peer will not send WireGuard traffic
+  to an endpoint it has not validated, so a node that cannot answer a disco ping
+  is unreachable on every direct path regardless of what its netmap says.
 - **WireGuard's `mac1` uses BLAKE2s in keyed mode, not HMAC** — while its KDF
   uses HMAC. Swapping them produces handshakes a peer drops without reply, which
   looks exactly like a firewall.
-- **`derp1.tailscale.com` is not in region 1's mesh** (`derp1i`/`derp1h` are).
-  The wrong node accepts you, completes its handshake, and routes nothing.
-- **HPACK decoding is unnecessary.** Response HEADERS frames can be skipped
-  whole; `SETTINGS_HEADER_TABLE_SIZE = 0` forbids the server from indexing,
-  which makes that safe rather than merely convenient. `WINDOW_UPDATE`, however,
-  is mandatory — the send window closes after 65535 bytes and stalls silently.
+- **`derp1.tailscale.com` is not in relay region 1's mesh.** The wrong node
+  accepts you, completes its handshake, and routes nothing.
+- **`WINDOW_UPDATE` is mandatory** — the send window closes after 65535 bytes and
+  the connection stalls silently. HPACK *decoding*, by contrast, can be skipped
+  entirely.
 
-The embedded side had its own lessons, recorded in the code: a smoltcp send
-buffer *is* the TCP window, so over an 80 ms relay a 768-byte buffer caps a
-transfer at 9 KB/s; and a future cancelled by `select` loses everything in its
-locals, which desynchronises a frame reader permanently if that is where the
-parser state lives.
+The embedded side had its own, recorded in the code: a send buffer *is* the TCP
+window, so over an 80 ms relay a 768-byte buffer caps a transfer at 9 KB/s; and a
+future cancelled by `select` loses everything in its locals, which desynchronises
+a frame reader permanently if that is where the parser state lives.
 
-## Testing
+### Testing
 
 Round-tripping a protocol against its own implementation proves self-consistency
 and nothing else — every KDF and DH ordering could be uniformly wrong and the
-tests would pass. So the ones that matter have a second opinion:
+tests would still pass. So the ones that matter have a second opinion:
 
 - BLAKE2s HMAC and KDF against vectors from Python's `hmac`/`hashlib`.
 - The WireGuard handshake and transport against
-  [boringtun](https://github.com/cloudflare/boringtun), in **both** directions —
-  our initiator against its responder and vice versa. It is a dev-dependency and
-  never reaches the firmware build.
+  [boringtun](https://github.com/cloudflare/boringtun), in **both** directions.
+  It is a dev-dependency and never reaches the firmware.
 
 ```sh
 cargo test                                                          # everything
@@ -246,24 +226,21 @@ cargo test -p tailscale-core --test interop_boringtun
 cargo build --target thumbv8m.main-none-eabihf -p tailscale-core    # no_std check
 ```
 
-## Caveats
+### Security note
 
-**DERP certificates are not verified on the device.** `embedded-tls` has no
-`no_std` certificate verification. It is defensible only because of what DERP
-carries: no credential transits it — authentication is a NaCl box against the
-node key — and every relayed byte is already WireGuard-encrypted end to end. A
-man-in-the-middle gets ciphertext, traffic metadata and the ability to drop
-packets; not decryption, forgery or access. The host binary verifies properly;
+**Relay certificates are not verified on the device.** `embedded-tls` has no
+`no_std` certificate verification. It is defensible only because of what that
+connection carries: no credential crosses it — authentication is a sealed box
+against the node key — and every relayed byte is already encrypted end to end. A
+man-in-the-middle gets ciphertext, traffic metadata, and the ability to drop
+packets; not decryption, forgery, or access. The laptop binary verifies properly;
 only the device makes this trade.
-
-**The control protocol is unstable.** Tailscale treats it as internal and
-changes it. This is a hobby project, not a supported client. If you want a
-control plane you can pin, use
-[Headscale](https://github.com/juanfont/headscale) — lando works against it too.
 
 Prior art worth reading, both targeting ESP32:
 [microlink](https://github.com/CamM2325/microlink) (C) and
 [tailscale-esp32](https://github.com/0xdilo/tailscale-esp32) (Rust).
+If you want a control plane you can pin, lando also works against
+[Headscale](https://github.com/juanfont/headscale).
 
 ## License
 
