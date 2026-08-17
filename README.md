@@ -1,198 +1,217 @@
 # lando
 
-A from-scratch Tailscale client for the Raspberry Pi Pico 2 W, written in Rust.
+A from-scratch Tailscale client for the Raspberry Pi Pico 2 W, in Rust. No
+Tailscale daemon, no Go runtime, no Linux — the wire protocol on bare metal, in
+392 KB of the RP2350's 512 KB of SRAM.
 
-The goal is a device you plug in, configure once over USB, and then reach from
-anywhere on your tailnet — with no port forwarding, no dynamic DNS, no router
-changes, and no server of your own to run. Once it is on the tailnet it proxies
-TCP onto the LAN it sits on, so a UPnP amplifier or any other local device
-becomes reachable remotely.
-
-Nothing here uses the official Tailscale client or daemon. It speaks the wire
-protocol directly.
-
-## Status
-
-Early. The control-plane path works against the real hosted control plane.
-
-| Stage | |
-|---|---|
-| HTTP/1.1 upgrade, cleartext `:80` | working |
-| Noise IK handshake | working |
-| ts2021 early payload | working |
-| HTTP/2 over Noise | working |
-| `POST /machine/register` | working — registers and authorizes |
-| Identity persistence across restarts | working |
-| `POST /machine/map` (netmap long-poll) | working — node reports online |
-| WireGuard handshake (both roles) | working — interops with boringtun |
-| WireGuard transport + replay window | working — interops with boringtun |
-| WireGuard timers / rekey / cookies | not started |
-| DERP framing + NaCl handshake | working — handshakes with a live relay |
-| DERP packet relay datapath | working — real Tailscale client handshakes over a live relay |
-| TSMP ping/pong | working — `tailscale ping` succeeds |
-| TCP over the tunnel (smoltcp) | working |
-| SOCKS5 proxy to the LAN | working — reaches a real LAN device |
-| Transparent port-forward | working — no client configuration at all |
-| RP2350 firmware — USB console | working — logs, and reboots to bootloader on `b` |
-| RP2350 firmware — WiFi join | working — associates in ~3 s |
-| RP2350 firmware — network stack | working — DHCP lease on the LAN |
-| RP2350 firmware — ts2021 control channel | working — Noise handshake with the real control plane |
-| RP2350 firmware — HTTP/2 + registration | working — the board registers itself as a node |
-| RP2350 firmware — netmap long-poll | working — the board reports **online** |
-| RP2350 firmware — WireGuard responder (UDP) | working — session established with a real client |
-| disco (endpoint validation) | working — direct paths validate |
-| RP2350 firmware — DERP | not started — only needed behind NAT |
-| USB provisioning to flash | working — image carries no secrets |
-
-A node registered by `lando-host` shows up in the admin console as a real
-machine, gets a tailnet address and a MagicDNS name, reports *online*, and
-answers `tailscale ping`:
+Plug the board into any network, configure it once over USB, and every device on
+that LAN becomes reachable from your tailnet.
 
 ```
-$ tailscale ping 100.64.0.1
-pong from lando (100.64.0.1) via TSMP in 723ms
+phone on 5G ──WireGuard──▶ DERP relay ──▶ Pico ──▶ 192.168.1.50:37193
+                                                   any host on its LAN
 ```
 
-That round trip is a real Tailscale client reaching this implementation through
-a live DERP relay: WireGuard handshake, session, TSMP decrypted and answered.
-It also carries TCP: a SOCKS5 proxy listens on the tunnel address, so any
-tailnet client can reach any host on the LAN the node sits on.
+## Why this is useful
 
-```
-tailnet client ──WireGuard/DERP──▶ lando:1080  (SOCKS5)      ──▶ any LAN host
-                                   lando:37193 (forwarded)   ──▶ one LAN host
-```
+Reaching a device on a home LAN from outside normally costs you one of these: a
+port forward, a dynamic-DNS record, a VPN server to run and patch, or a cloud
+relay you rent. Each is a permanent thing to maintain, and the first two put your
+network on the public internet.
 
-A forwarded port needs nothing configured on the client — the tunnel address
-behaves exactly as the LAN device does:
+lando is a $7 board that removes all of them. It joins your tailnet as an
+ordinary node and advertises its LAN as a subnet route, so from anywhere you
+just address LAN hosts directly:
 
 ```sh
-LANDO_FORWARD="37193=192.168.1.50:37193" cargo run -p lando-host -- node
-curl http://lando-tailnet-ip:37193/...        # straight through
+curl http://192.168.1.50:37193/description.xml    # from a phone on cellular
 ```
 
-Verified end to end against a real UPnP amplifier: `HTTP/1.1 200 OK`, device
-description and all.
+Every connection is end-to-end WireGuard, authenticated by your tailnet's
+identity, and every connection is outbound — nothing about your network is
+exposed, and the router is never touched.
 
-**Reachability currently requires Headscale.** Registered against Tailscale's
-hosted control plane the node comes online but peers are never told where to
-reach it — see the protocol notes below.
+It grew out of an earlier project that did the same job by parking an outbound
+WebSocket at a Cloudflare Worker. That Worker was a permanent hosted dependency,
+a second codebase to keep in sync, and a place where a device credential lived.
+A tailnet already solves NAT traversal, identity, key exchange and transport
+encryption, so none of it needs to exist.
+
+It is also, as far as I can tell, the smallest complete Tailscale node there is:
+control plane, WireGuard, disco, DERP and a TCP proxy in a microcontroller with
+no MMU, no allocator and no operating system.
+
+## What works
+
+Running on hardware against Tailscale's real hosted control plane:
+
+| | |
+|---|---|
+| Registers as a real node | tailnet IP, MagicDNS name, reports online |
+| Reachable behind NAT | holds a DERP relay connection open, reconnects with backoff |
+| Direct paths | disco endpoint validation, `tailscale ping` in ~39 ms on-LAN |
+| Subnet router | advertises and routes its whole LAN over the tailnet |
+| Provisioning | WiFi and tailnet credentials over USB; the image carries no secrets |
+
+Measured, fetching a 172 KB file through the tunnel, byte-identical each time:
+
+```
+direct path    2.8 s   (61 KB/s)
+via DERP       8.4 s   (20 KB/s)
+```
+
+The relay figure is dominated by per-packet cost — WireGuard and TLS are both in
+software on a 150 MHz core. It is comfortable for controlling things and poor for
+moving bulk data, which is the intended trade.
+
+### Using it with a device's own app
+
+Vendor apps generally work, because the tunnel forwards bytes and never parses
+them — a WebSocket upgrade, a raw control protocol on an odd port, or UPnP SOAP
+all cross unchanged. Two things decide whether a given app is happy:
+
+- **It must let you enter an address.** Discovery does not cross the tunnel:
+  mDNS and SSDP are both UDP multicast, and a tailnet is not a multicast
+  domain. An app that can only find devices by scanning will not find them.
+  Nor will a hostname like `device.local` resolve.
+- **Its port must be in `PORTS`.** Ports are preallocated, so anything not
+  listed is simply not routed. Check what the device actually listens on rather
+  than assuming — the Lyngdorf amplifier this was built for serves its web UI
+  and WebSocket on `80`, UPnP on `37193`, and takes its app's control protocol
+  on `84`.
+
+Long-lived idle connections are fine: a WebSocket held open for a minute with no
+traffic survives, which is the normal state of a control channel between
+commands.
+
+**Other limits.** The listener count per port is the concurrency limit for that
+port — smoltcp has no accept queue, so a connection arriving with none free is
+refused rather than queued. One peer at a time. DERP certificates are not
+verified (see [Caveats](#caveats)).
 
 ## Layout
 
 ```
 crates/tailscale-core/   no_std, sans-IO. Protocol state machines, zero I/O.
-crates/lando-host/       std binary: runs the core on a dev machine.
-crates/lando-fw/         no_std firmware for the Pico 2 W. (not yet present)
+crates/lando-host/       std binary: runs the same core on a laptop.
+crates/lando-fw/         no_std firmware for the Pico 2 W.
 ```
 
-`tailscale-core` never touches a socket, a clock, or an allocator. Every
-protocol is a state machine over byte slices, so the *same compiled logic* runs
-under a debugger on a laptop and on a microcontroller that has neither a
-debugger nor an operating system. Protocol code that can only be exercised by
-flashing a board does not get exercised, and bare-metal debugging is a bad place
-to discover that a length prefix is little-endian.
+`tailscale-core` never touches a socket, a clock or an allocator, so the *same
+compiled logic* runs under a debugger on a laptop and on a board that has
+neither a debugger nor an OS. That split is the reason this was tractable: the
+board has USB CDC logging and nothing else, and bare metal is a bad place to
+discover that a length prefix is little-endian.
 
 ## Try it
 
+On a laptop, no hardware required:
+
 ```sh
 cargo test
+echo 'tskey-auth-...' > .lando-authkey     # or omit for interactive login
 cargo run -p lando-host
 ```
 
-With no pre-auth key present, `lando-host` registers interactively: it prints a
-URL, you open it in a browser signed in to your tailnet, and a follow-up request
-completes the login. For headless use — which is the point of the project —
-supply a pre-auth key instead:
+The node appears in your admin console. `LANDO_TRACE=1` dumps the HTTP/2
+exchange — everything on the wire is inside Noise, so a packet capture shows
+only ciphertext and this is the only way to watch the protocol.
+
+On hardware:
 
 ```sh
-echo 'tskey-auth-...' > .lando-authkey
-cargo run -p lando-host
+make cyw43-firmware    # radio blobs, fetched rather than vendored
+make flash             # reboots the board into its bootloader, then flashes
+make console           # USB serial console
 ```
 
-`LANDO_TRACE=1` dumps the HTTP/2 frame exchange. Everything on the wire is
-inside Noise, so a packet capture shows only ciphertext; this is the only way to
-watch the protocol.
+In the console, set `ssid`, `pass` and `key` (a tailnet pre-auth key), then
+`save`. Credentials live in their own flash sector and never in the image, so
+every board runs byte-identical firmware. `show` prints the current config and
+`clear` erases it.
 
-State lands in `.lando-state` (machine key and node key, mode `0600`). Both that
-and `.lando-authkey` are gitignored. Treat a pre-auth key like an SSH private
-key until it is used or revoked.
+`make flash` works without anyone touching the board: the running firmware takes
+`b` on its console as "hand yourself back to the bootloader". Without that, every
+reflash needs a human holding BOOTSEL while replugging.
 
 ## Notes on the protocol
 
-Some of this is undocumented, so a few findings worth recording:
+Tailscale treats this interface as internal and does not document it. The
+findings that cost the most to establish, in case they save someone else the
+time:
 
 - **The control channel needs no TLS.** `POST /ts2021` on **port 80**, in the
-  clear, with the Noise initiation base64'd into `X-Tailscale-Handshake`. Noise
-  supplies confidentiality and authentication on top. Port 443 exists as a
-  TLS-wrapped fallback whose certificate upstream deliberately does not verify.
+  clear, Noise initiation base64'd into `X-Tailscale-Handshake`. Noise supplies
+  confidentiality and authentication on top. This is what makes a client on a
+  microcontroller tractable at all.
+- **A streaming `MapRequest` is read-only.** With `Stream: true` and
+  `Version >= 68` the server ignores `Hostinfo` and `Endpoints` entirely. A
+  client that only long-polls goes *online* and yet publishes no endpoints, no
+  relay and no connectivity data — with no error anywhere. Send those on a
+  separate one-shot request (`Stream: false`, `OmitPeers: true`).
 - **An early payload precedes HTTP/2.** After the handshake the server sends
-  `\xff\xff\xffTS`, a 4-byte big-endian length, then JSON — currently a
-  `nodeKeyChallenge`. Feed that to an HTTP/2 parser and it desynchronises and
-  hangs forever waiting for a frame that never arrives.
-- **The record nonce is big-endian.** Noise specifies little-endian; this does
-  not follow it. Transport records also use empty AEAD associated data, while
-  the handshake uses the running hash.
-- **HPACK decoding is unnecessary.** Response HEADERS frames can be skipped
-  entirely. Sending `SETTINGS_HEADER_TABLE_SIZE = 0` forbids the server from
-  indexing, which makes that safe rather than merely convenient.
-- **`WINDOW_UPDATE` is not optional.** The server's send window closes after
-  65535 bytes and the connection then stalls silently.
-- Noise frames cap at 4096 bytes, so the record layer needs one fixed buffer
-  regardless of message size. Everything above it has to stream.
-- **WireGuard disagrees with ts2021 on byte order.** Same cipher, same 12-byte
-  nonce layout, but WireGuard counts little-endian and ts2021 big-endian. The
-  netmap's frame length prefix is little-endian too, while every other length
-  on the control connection is big-endian.
-- **disco is not optional.** A peer probes a candidate endpoint and will not
-  send WireGuard there until it gets a disco pong, so a node that cannot answer
-  disco is unreachable on every direct path no matter what its netmap
-  advertises. The symptom is total silence at both ends.
+  `\xff\xff\xffTS`, a 4-byte big-endian length, then JSON. Feed it to an HTTP/2
+  parser and the connection desynchronises and hangs forever.
+- **The record nonce is big-endian**, though Noise specifies little-endian. And
+  WireGuard, using the same cipher and nonce layout, counts little-endian. The
+  netmap's length prefix is little-endian too, while every other length on the
+  control connection is big-endian.
+- **An unparseable `IPNVersion` silently discards the whole `Hostinfo`.** No
+  error; the struct simply never appears, and everything in it goes too.
+- **disco is not optional.** A peer will not send WireGuard to an endpoint it
+  has not validated with a disco pong, so a node that cannot answer disco is
+  unreachable on every direct path regardless of its netmap. The symptom is
+  silence at both ends.
 - **WireGuard's `mac1` uses BLAKE2s in keyed mode, not HMAC** — while its KDF
-  uses HMAC. Swapping them yields handshakes a peer drops without reply, which
-  is indistinguishable from a firewall problem.
-- **An unparseable `IPNVersion` silently discards the entire Hostinfo.** No
-  error is returned; the struct simply never appears. Everything inside it goes
-  with it, including the `NetInfo` that tells peers where to reach you.
-- **`derp1.tailscale.com` is not in DERP region 1's mesh.** Region 1's nodes are
-  `derp1i`/`derp1h`. Connect to the wrong one and the relay accepts you,
-  completes its handshake, and then quietly fails to route anything, because
-  peers reach region 1 through servers yours is not meshed with.
-- **Peers are only told where to reach you via `Hostinfo.NetInfo.PreferredDERP`.**
-  Headscale turns that into `Node.HomeDERP`; Tailscale's hosted control plane
-  ignores the identical request, so a node registered there stays unreachable.
-  `Node.DERP` (`127.3.3.40:N`) is the deprecated form of the same thing.
+  uses HMAC. Swapping them produces handshakes a peer drops without reply, which
+  looks exactly like a firewall.
+- **`derp1.tailscale.com` is not in region 1's mesh** (`derp1i`/`derp1h` are).
+  The wrong node accepts you, completes its handshake, and routes nothing.
+- **HPACK decoding is unnecessary.** Response HEADERS frames can be skipped
+  whole; `SETTINGS_HEADER_TABLE_SIZE = 0` forbids the server from indexing,
+  which makes that safe rather than merely convenient. `WINDOW_UPDATE`, however,
+  is mandatory — the send window closes after 65535 bytes and stalls silently.
+
+The embedded side had its own lessons, recorded in the code: a smoltcp send
+buffer *is* the TCP window, so over an 80 ms relay a 768-byte buffer caps a
+transfer at 9 KB/s; and a future cancelled by `select` loses everything in its
+locals, which desynchronises a frame reader permanently if that is where the
+parser state lives.
 
 ## Testing
 
-Unit tests that round-trip a protocol against its own implementation prove
-self-consistency and nothing more — every KDF, DH ordering and hash-mixing
-detail could be uniformly wrong and they would still pass. So the important
-tests are the ones with a second opinion:
+Round-tripping a protocol against its own implementation proves self-consistency
+and nothing else — every KDF and DH ordering could be uniformly wrong and the
+tests would pass. So the ones that matter have a second opinion:
 
-- The BLAKE2s HMAC and KDF are checked against vectors generated by Python's
-  `hmac`/`hashlib`.
-- The WireGuard handshake and transport are checked against
-  [boringtun](https://github.com/cloudflare/boringtun), Cloudflare's independent
-  implementation, in **both** directions — our initiator against its responder
-  and vice versa, including transport packets each way. boringtun is a
-  dev-dependency and never reaches the firmware build.
+- BLAKE2s HMAC and KDF against vectors from Python's `hmac`/`hashlib`.
+- The WireGuard handshake and transport against
+  [boringtun](https://github.com/cloudflare/boringtun), in **both** directions —
+  our initiator against its responder and vice versa. It is a dev-dependency and
+  never reaches the firmware build.
 
 ```sh
-cargo test                                       # everything
-cargo run -p lando-host -- derp                  # handshake against a real relay
+cargo test                                                          # everything
 cargo test -p tailscale-core --test interop_boringtun
-cargo build --target thumbv8m.main-none-eabihf -p tailscale-core   # no_std check
+cargo build --target thumbv8m.main-none-eabihf -p tailscale-core    # no_std check
 ```
 
 ## Caveats
 
-The control protocol is not documented or stabilized by Tailscale, which treats
-it as an internal interface. It changes. This is a hobby project and a
-maintenance commitment, not a supported client — if you want a self-hosted
-control plane you can pin, look at [Headscale](https://github.com/juanfont/headscale).
+**DERP certificates are not verified on the device.** `embedded-tls` has no
+`no_std` certificate verification. It is defensible only because of what DERP
+carries: no credential transits it — authentication is a NaCl box against the
+node key — and every relayed byte is already WireGuard-encrypted end to end. A
+man-in-the-middle gets ciphertext, traffic metadata and the ability to drop
+packets; not decryption, forgery or access. The host binary verifies properly;
+only the device makes this trade.
 
-Prior art worth reading, both of which target ESP32:
+**The control protocol is unstable.** Tailscale treats it as internal and
+changes it. This is a hobby project, not a supported client. If you want a
+control plane you can pin, use
+[Headscale](https://github.com/juanfont/headscale) — lando works against it too.
+
+Prior art worth reading, both targeting ESP32:
 [microlink](https://github.com/CamM2325/microlink) (C) and
 [tailscale-esp32](https://github.com/0xdilo/tailscale-esp32) (Rust).
 

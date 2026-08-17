@@ -1,6 +1,6 @@
 //! Subnet routing: tailnet TCP in, LAN TCP out.
 //!
-//! Packets arriving over WireGuard are addressed to LAN hosts — `192.168.86.41`,
+//! Packets arriving over WireGuard are addressed to LAN hosts — `192.168.1.50`,
 //! not to this device — because the tailnet believes this node routes the
 //! subnet. Two ways to honour that: forward the IP packets themselves with
 //! address translation, or terminate each TCP connection here and open a fresh
@@ -51,11 +51,16 @@ use crate::logln;
 /// weighted by how a client actually uses them — a browser opens many
 /// connections to 80 and 443, while a control protocol on 37193 is mostly
 /// sequential but should not fail a burst either.
-pub const PORTS: [u16; 18] = [
-    80, 80, 80, 80, 80, 80, 80, 80, //
-    443, 443, 443, 443, //
-    1400, 1400, //
-    37193, 37193, 37193, 37193,
+pub const PORTS: [u16; 16] = [
+    // Web UIs, and the WebSocket control channel some devices upgrade from.
+    80, 80, 80, 80, 80, 80, //
+    // Raw control protocols. A Lyngdorf amplifier takes commands here, and
+    // speaks nothing until the client does — which the tunnel does not care
+    // about, since it forwards bytes and never parses them.
+    84, 84, 84, 84, 84, //
+    443, 443, //
+    // UPnP/DLNA control.
+    37193, 37193, 37193,
 ];
 
 /// Per-socket buffers, sized by round-trip rather than by message size.
@@ -72,6 +77,14 @@ pub const PORTS: [u16; 18] = [
 /// built on the stack.
 const TCP_RX: usize = 1024;
 const TCP_TX: usize = 8192;
+
+/// How long a connection may go completely silent before it is torn down.
+///
+/// This is a backstop against stranding a worker, not a policy on idleness:
+/// normal teardown is detected from the client's FIN. It is therefore set long
+/// enough that a legitimately quiet connection — a WebSocket between commands,
+/// an event subscription waiting on an event — is never the thing it catches.
+const IDLE_LIMIT: Duration = Duration::from_secs(900);
 
 /// Largest IP packet either side will carry.
 const MTU: usize = 1400;
@@ -447,7 +460,13 @@ async fn splice(
     let mut rx = [0u8; 1024];
     let mut tx = [0u8; 1024];
     let mut lan = TcpSocket::new(stack, &mut rx, &mut tx);
-    lan.set_timeout(Some(Duration::from_secs(30)));
+    // Long, with keep-alive underneath. A WebSocket — which is how control
+    // apps talk to devices like these — is idle by nature between commands,
+    // and an inactivity timeout short enough to reclaim a stuck socket is far
+    // too short to hold a healthy connection. Keep-alive detects a LAN host
+    // that has actually died, which is what the timeout was really for.
+    lan.set_timeout(Some(IDLE_LIMIT));
+    lan.set_keep_alive(Some(Duration::from_secs(45)));
 
     let addr = embassy_net::Ipv4Address::from(dst.octets());
     // Distinguish "the LAN host refused us" from "the stack had no socket to
@@ -539,7 +558,7 @@ async fn relay(
         if !heard_from_lan && waited > Duration::from_secs(6) {
             return "lan silent";
         }
-        if waited > Duration::from_secs(20) {
+        if waited > IDLE_LIMIT {
             return "idle";
         }
 

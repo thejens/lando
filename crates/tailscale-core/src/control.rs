@@ -818,7 +818,7 @@ mod tests {
                 stream: false,
                 keep_alive: false,
                 omit_peers: true,
-                endpoints: &["192.168.86.42:41641"],
+                endpoints: &["192.168.1.42:41641"],
                 endpoint_types: &[endpoint_type::LOCAL],
             },
         )
@@ -831,7 +831,7 @@ mod tests {
         assert!(out.contains(r#""MappingVariesByDestIP":false"#));
         assert!(out.contains(r#""DERPLatency":{"12-v4":0.055}"#));
         assert!(out.contains(r#""LinkType":"wifi""#));
-        assert!(out.contains(r#""Endpoints":["192.168.86.42:41641"]"#));
+        assert!(out.contains(r#""Endpoints":["192.168.1.42:41641"]"#));
         // Anything that would make the server treat this as read-only.
         assert!(!out.contains("Stream"));
         assert!(!out.contains("ReadOnly"));
@@ -844,7 +844,7 @@ mod tests {
     fn derp_placeholder_is_read_back() {
         assert_eq!(derp_region("127.3.3.40:1"), Some(1));
         assert_eq!(derp_region("127.3.3.40:255"), Some(255));
-        assert_eq!(derp_region("192.168.86.41:41641"), None);
+        assert_eq!(derp_region("192.168.1.50:41641"), None);
     }
 
     /// The length prefix is little-endian here, unlike every other length on
