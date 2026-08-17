@@ -738,27 +738,36 @@ async fn main(spawner: Spawner) {
         }
     };
 
+    // Retried rather than attempted once. This device is expected to live on a
+    // mains adapter with nobody watching, and a cold boot races the access
+    // point — after a power cut the board is up long before the router is.
+    // Proceeding without a link used to leave it waiting forever for a DHCP
+    // lease that could never arrive, which is indistinguishable from a dead
+    // board and needs a human to power-cycle it.
     logln!("radio: joining {:?} ({} char key)", cfg.ssid.as_str(), cfg.password.len());
-    let started = embassy_time::Instant::now();
-    let joined = control
-        .join(
-            cfg.ssid.as_str(),
-            cyw43::JoinOptions::new(cfg.password.as_bytes()),
-        )
-        .await;
-    let status: String<64> = match &joined {
-        Ok(_) => {
-            let mut s: String<64> = String::new();
-            let _ = core::write!(&mut s, "joined in {} ms", started.elapsed().as_millis());
-            s
+    let mut attempt = 0u32;
+    let mut backoff = 2u64;
+    loop {
+        let started = embassy_time::Instant::now();
+        match control
+            .join(
+                cfg.ssid.as_str(),
+                cyw43::JoinOptions::new(cfg.password.as_bytes()),
+            )
+            .await
+        {
+            Ok(_) => {
+                logln!("radio: joined in {} ms", started.elapsed().as_millis());
+                break;
+            }
+            Err(e) => {
+                attempt += 1;
+                logln!("radio: join failed ({:?}), retry {} in {}s", e, attempt, backoff);
+                Timer::after(Duration::from_secs(backoff)).await;
+                backoff = (backoff * 2).min(30);
+            }
         }
-        Err(e) => {
-            let mut s: String<64> = String::new();
-            let _ = core::write!(&mut s, "join failed: {:?}", e);
-            s
-        }
-    };
-    logln!("radio: {}", status);
+    }
 
     // ---- network stack ----
     // Seeded from the hardware TRNG initialised at boot: this seeds TCP
@@ -786,7 +795,20 @@ async fn main(spawner: Spawner) {
 
     logln!("net: waiting for DHCP");
     let dhcp_started = embassy_time::Instant::now();
-    stack.wait_config_up().await;
+    // Bounded, because an unbounded wait here is the same trap as an
+    // unretried join: associated to an access point that is not yet serving
+    // leases, the device would wait for one indefinitely. A reset is crude but
+    // it is the one recovery that always works, and this runs unattended.
+    if embassy_futures::select::select(
+        stack.wait_config_up(),
+        Timer::after(Duration::from_secs(60)),
+    )
+    .await
+    .is_second()
+    {
+        logln!("net: no DHCP lease in 60s, resetting");
+        cortex_m::peripheral::SCB::sys_reset();
+    }
     let mut addr: String<64> = String::new();
     let mut endpoint: String<32> = String::new();
     let mut subnet: String<24> = String::new();
@@ -823,216 +845,205 @@ async fn main(spawner: Spawner) {
         cfg.control_key.as_str()
     };
 
+    // Config faults are terminal: no amount of retrying fixes a missing key,
+    // and a device that reboots forever over it is harder to diagnose than one
+    // that sits still and says why.
+    let Ok(control_key) = tailscale_core::key::MachinePublic::parse(key_str) else {
+        loop {
+            logln!("control: bad control key — reprovision with `ckey`");
+            Timer::after(Duration::from_secs(30)).await;
+        }
+    };
+    let (Some(machine_bytes), Some(node_bytes)) = (cfg.machine_key, cfg.node_key) else {
+        loop {
+            logln!("control: no device keys — reprovision and reboot");
+            Timer::after(Duration::from_secs(30)).await;
+        }
+    };
+    let node_key = tailscale_core::key::NodePrivate::from_bytes(node_bytes);
+
+    // Identity and peer state outlive any one control session. A reconnect
+    // must not look like a different node to the tailnet, and a peer that
+    // handshaked before it should not have to handshake again.
+    let mut disco_seed = [0u8; 32];
+    rand_core::RngCore::fill_bytes(&mut trng, &mut disco_seed);
+    // One disco key: the netmap advertises it and the UDP responder opens
+    // pings with it, so they must be the same key.
+    let disco = tailscale_core::key::DiscoPrivate::from_bytes(disco_seed);
+    let mut wg_seed = [0u8; 4];
+    rand_core::RngCore::fill_bytes(&mut trng, &mut wg_seed);
+    // One state machine, two transports. A session negotiated over UDP has to
+    // stay usable when the peer later arrives via the relay, so neither path
+    // may own it.
+    let node = wg::Shared::new(core::cell::RefCell::new(wg::Node::new(
+        &node_key,
+        &disco,
+        u32::from_le_bytes(wg_seed),
+    )));
+    // The tailnet-side stack. Every address it answers for belongs to the LAN
+    // and is reached by opening a second connection to it. Taken once: the
+    // storage is far too large to build on the stack and move into place, so
+    // it is laid out statically and handed over by reference.
+    let tunnel = TunnelShared::new(core::cell::RefCell::new(tunnel::Tunnel::new(unsafe {
+        tunnel::storage()
+    })));
+
+    // Claimed once, above the loop. A StaticCell panics on a second init, so
+    // reconnecting would take the device down on the first retry.
+    static RX: StaticCell<[u8; 4096]> = StaticCell::new();
+    static TX: StaticCell<[u8; 2048]> = StaticCell::new();
+    let ctl_rx = RX.init([0; 4096]);
+    let ctl_tx = TX.init([0; 2048]);
+    // Relay buffers are the largest single allocation in the firmware; keeping
+    // them static makes that cost explicit.
+    static DERP_BUFS: StaticCell<derp::Buffers> = StaticCell::new();
+    static DERP_RX: StaticCell<[u8; 2048]> = StaticCell::new();
+    static DERP_TX: StaticCell<[u8; 2048]> = StaticCell::new();
+    let derp_bufs = DERP_BUFS.init(derp::Buffers::new());
+    let derp_rx = DERP_RX.init([0; 2048]);
+    let derp_tx = DERP_TX.init([0; 2048]);
+
+    let routes: [&str; 1] = [subnet.as_str()];
+    let routes: &[&str] = if subnet.is_empty() { &[] } else { &routes };
+
     let mut control_status: String<64> = String::new();
-    let machine_key = cfg.machine_key.map(tailscale_core::key::MachinePrivate::from_bytes);
-    let node_key = cfg.node_key.map(tailscale_core::key::NodePrivate::from_bytes);
+    let mut backoff = 1u64;
+    let mut consecutive_failures = 0u32;
 
-    match (
-        tailscale_core::key::MachinePublic::parse(key_str),
-        machine_key,
-        node_key,
-    ) {
-        (Ok(control_key), Some(machine_key), Some(node_key)) => {
-            let mut seed = [0u8; 32];
-            rand_core::RngCore::fill_bytes(&mut trng, &mut seed);
-            let ephemeral = tailscale_core::key::MachinePrivate::from_bytes(seed);
+    // The session is supervised, not run once. Everything below can fail for
+    // ordinary reasons — the control plane restarts, WiFi drops a few packets,
+    // the long poll ends — and the node is online only while this connection
+    // is. Falling out of it without reconnecting leaves a device that is
+    // powered, associated, and silently absent from the tailnet.
+    loop {
+        control_status.clear();
+        let mut seed = [0u8; 32];
+        rand_core::RngCore::fill_bytes(&mut trng, &mut seed);
+        let ephemeral = tailscale_core::key::MachinePrivate::from_bytes(seed);
+        // Rebuilt per attempt because the connection consumes it.
+        let machine_key = tailscale_core::key::MachinePrivate::from_bytes(machine_bytes);
 
-            static RX: StaticCell<[u8; 4096]> = StaticCell::new();
-            static TX: StaticCell<[u8; 2048]> = StaticCell::new();
-            let started = embassy_time::Instant::now();
-            match control::connect(
-                stack,
-                host,
-                port,
-                &control_key,
-                machine_key,
-                ephemeral,
-                tailscale_core::CAPABILITY_VERSION,
-                RX.init([0; 4096]),
-                TX.init([0; 2048]),
-            )
-            .await
-            {
-                Err(e) => {
-                    let _ = core::write!(&mut control_status, "ts2021 failed: {:?}", e);
-                }
-                Ok((mut socket, session, leftover, leftover_len)) => {
-                    logln!("control: ts2021 up in {} ms", started.elapsed().as_millis());
-                    match h2conn::H2Conn::start(&mut socket, session, &leftover[..leftover_len])
-                        .await
-                    {
-                        Err(e) => {
-                            let _ = core::write!(&mut control_status, "h2 failed: {:?}", e);
-                        }
-                        Ok(mut conn) => {
-                            let routes: [&str; 1] = [subnet.as_str()];
-                            let routes: &[&str] =
-                                if subnet.is_empty() { &[] } else { &routes };
-                            match register(
-                                &mut conn,
-                                &mut socket,
-                                host,
-                                &cfg,
-                                &node_key.public(),
-                                routes,
-                            )
+        let started = embassy_time::Instant::now();
+        match control::connect(
+            stack,
+            host,
+            port,
+            &control_key,
+            machine_key,
+            ephemeral,
+            tailscale_core::CAPABILITY_VERSION,
+            ctl_rx,
+            ctl_tx,
+        )
+        .await
+        {
+            Err(e) => {
+                let _ = core::write!(&mut control_status, "ts2021 failed: {:?}", e);
+            }
+            Ok((mut socket, session, leftover, leftover_len)) => {
+                logln!("control: ts2021 up in {} ms", started.elapsed().as_millis());
+                match h2conn::H2Conn::start(&mut socket, session, &leftover[..leftover_len]).await
+                {
+                    Err(e) => {
+                        let _ = core::write!(&mut control_status, "h2 failed: {:?}", e);
+                    }
+                    Ok(mut conn) => {
+                        match register(&mut conn, &mut socket, host, &cfg, &node_key.public(), routes)
                             .await
-                            {
-                                Err(e) => {
-                                    let _ =
-                                        core::write!(&mut control_status, "register: {:?}", e);
+                        {
+                            Err(e) => {
+                                let _ = core::write!(&mut control_status, "register: {:?}", e);
+                            }
+                            Ok(text) => {
+                                logln!("control: {}", text.as_str());
+                                // Before the poll, because the poll is
+                                // read-only: this is the only request on the
+                                // connection the server will accept a
+                                // description of this device from.
+                                if let Err(e) = advertise(
+                                    &mut conn,
+                                    &mut socket,
+                                    host,
+                                    &node_key.public(),
+                                    &disco.public(),
+                                    endpoint.as_str(),
+                                    routes,
+                                )
+                                .await
+                                {
+                                    logln!("advertise failed: {:?}", e);
                                 }
-                                Ok(text) => {
-                                    logln!("control: {}", text.as_str());
-                                    // One disco key: the netmap advertises it
-                                    // and the UDP responder opens pings with
-                                    // it, so they must be the same key.
-                                    let mut disco = [0u8; 32];
-                                    rand_core::RngCore::fill_bytes(&mut trng, &mut disco);
-                                    let disco =
-                                        tailscale_core::key::DiscoPrivate::from_bytes(disco);
-                                    // Before the poll, because the poll is
-                                    // read-only: this is the only request on
-                                    // the connection the server will accept a
-                                    // description of this device from.
-                                    if let Err(e) = advertise(
+                                // A long-poll is quiet by design: the server
+                                // holds the response open and sends nothing
+                                // until the tailnet changes. The short timeout
+                                // used for the handshake would abort it during
+                                // normal operation.
+                                socket.set_timeout(Some(embassy_time::Duration::from_secs(300)));
+                                // Connected, so the next failure starts over
+                                // rather than inheriting a long delay from
+                                // whatever went wrong before it.
+                                backoff = 1;
+                                consecutive_failures = 0;
+
+                                let relay = async {
+                                    // Polled, not checked once: the flag lives
+                                    // in RAM and is set by the console at
+                                    // runtime, so parking forever on the first
+                                    // read would make the command unusable.
+                                    while !DERP_ENABLED.load(core::sync::atomic::Ordering::Relaxed)
+                                    {
+                                        Timer::after(Duration::from_secs(1)).await;
+                                    }
+                                    // Reconnect rather than give up: a dropped
+                                    // relay is a loss of reachability, and the
+                                    // device has no other way back for a peer
+                                    // that is not on this LAN.
+                                    let mut relay_backoff = 1u64;
+                                    loop {
+                                        let e = derp::run(
+                                            stack,
+                                            DERP_HOST,
+                                            node_key.as_bytes(),
+                                            node_key.public().as_bytes(),
+                                            &mut trng,
+                                            &mut *derp_bufs,
+                                            &mut *derp_rx,
+                                            &mut *derp_tx,
+                                            &node,
+                                            &tunnel,
+                                        )
+                                        .await;
+                                        logln!("derp: lost ({:?}), retry in {}s", e, relay_backoff);
+                                        Timer::after(Duration::from_secs(relay_backoff)).await;
+                                        relay_backoff = (relay_backoff * 2).min(60);
+                                    }
+                                };
+
+                                let polled = embassy_futures::select::select4(
+                                    map_poll(
                                         &mut conn,
                                         &mut socket,
                                         host,
                                         &node_key.public(),
                                         &disco.public(),
-                                        endpoint.as_str(),
-                                        routes,
-                                    )
-                                    .await
-                                    {
-                                        logln!("advertise failed: {:?}", e);
+                                    ),
+                                    wg::serve(stack, &node, &tunnel),
+                                    relay,
+                                    tunnel::serve(stack, &tunnel),
+                                )
+                                .await;
+                                let polled = match polled {
+                                    embassy_futures::select::Either4::First(r) => r,
+                                    _ => Ok(()),
+                                };
+                                match polled {
+                                    Ok(()) => {
+                                        let _ =
+                                            core::write!(&mut control_status, "map stream ended");
                                     }
-                                    // A long-poll is quiet by design: the
-                                    // server holds the response open and sends
-                                    // nothing until the tailnet changes. The
-                                    // 20 s idle timeout used for the handshake
-                                    // would abort it during normal operation.
-                                    socket.set_timeout(Some(
-                                        embassy_time::Duration::from_secs(300),
-                                    ));
-                                    // Runs until the connection drops; the node
-                                    // is online for exactly as long as it does.
-                                    let mut wg_seed = [0u8; 4];
-                                    rand_core::RngCore::fill_bytes(&mut trng, &mut wg_seed);
-                                    let wg_index = u32::from_le_bytes(wg_seed);
-                                    // One state machine, two transports. A
-                                    // session negotiated over UDP has to stay
-                                    // usable when the peer later arrives via
-                                    // the relay, so neither path may own it.
-                                    let node = wg::Shared::new(
-                                        core::cell::RefCell::new(wg::Node::new(
-                                            &node_key, &disco, wg_index,
-                                        )),
-                                    );
-                                    // The tailnet-side stack. Its address is
-                                    // ours; every other address it answers for
-                                    // belongs to the LAN and is reached by
-                                    // opening a second connection to it.
-                                    // Taken once, here. The storage is far too
-                                    // large to build on the stack and move
-                                    // into place, so it is laid out statically
-                                    // and handed over by reference.
-                                    let tunnel = TunnelShared::new(core::cell::RefCell::new(
-                                        tunnel::Tunnel::new(unsafe { tunnel::storage() }),
-                                    ));
-                                    // Both halves block forever by design: the
-                                    // poll is what keeps the node online, the
-                                    // UDP socket is what makes it reachable.
-                                    // Relay buffers are the largest single
-                                    // allocation in the firmware; keeping them
-                                    // static makes that cost explicit.
-                                    static DERP_BUFS: StaticCell<derp::Buffers> =
-                                        StaticCell::new();
-                                    static DERP_RX: StaticCell<[u8; 2048]> = StaticCell::new();
-                                    static DERP_TX: StaticCell<[u8; 2048]> = StaticCell::new();
-                                    let relay = async {
-                                        // Polled, not checked once: the flag
-                                        // lives in RAM and is set by the
-                                        // console at runtime, so parking
-                                        // forever on the first read would make
-                                        // the command impossible to use.
-                                        while !DERP_ENABLED
-                                            .load(core::sync::atomic::Ordering::Relaxed)
-                                        {
-                                            Timer::after(Duration::from_secs(1)).await;
-                                        }
-                                        // Reconnect rather than give up: a
-                                        // dropped relay is a loss of
-                                        // reachability, and the device has no
-                                        // other way back for a peer that is
-                                        // not on this LAN.
-                                        //
-                                        // Claimed once, outside the loop:
-                                        // a StaticCell panics on a second
-                                        // init, so reconnecting would take
-                                        // the device down on the first
-                                        // retry.
-                                        let derp_bufs =
-                                            DERP_BUFS.init(derp::Buffers::new());
-                                        let derp_rx = DERP_RX.init([0; 2048]);
-                                        let derp_tx = DERP_TX.init([0; 2048]);
-                                        let mut backoff = 1u64;
-                                        loop {
-                                            let e = derp::run(
-                                                stack,
-                                                DERP_HOST,
-                                                node_key.as_bytes(),
-                                                node_key.public().as_bytes(),
-                                                &mut trng,
-                                                derp_bufs,
-                                                derp_rx,
-                                                derp_tx,
-                                                &node,
-                                                &tunnel,
-                                            )
-                                            .await;
-                                            logln!(
-                                                "derp: lost ({:?}), retry in {}s",
-                                                e,
-                                                backoff
-                                            );
-                                            Timer::after(Duration::from_secs(backoff)).await;
-                                            backoff = (backoff * 2).min(60);
-                                        }
-                                    };
-
-                                    let polled = embassy_futures::select::select4(
-                                        map_poll(
-                                            &mut conn,
-                                            &mut socket,
-                                            host,
-                                            &node_key.public(),
-                                            &disco.public(),
-                                        ),
-                                        wg::serve(stack, &node, &tunnel),
-                                        relay,
-                                        tunnel::serve(stack, &tunnel),
-                                    )
-                                    .await;
-                                    let polled = match polled {
-                                        embassy_futures::select::Either4::First(r) => r,
-                                        _ => Ok(()),
-                                    };
-                                    match polled {
-                                        Ok(()) => {
-                                            let _ = core::write!(
-                                                &mut control_status,
-                                                "map stream ended"
-                                            );
-                                        }
-                                        Err(e) => {
-                                            let _ = core::write!(
-                                                &mut control_status,
-                                                "map failed: {:?}",
-                                                e
-                                            );
-                                        }
+                                    Err(e) => {
+                                        let _ =
+                                            core::write!(&mut control_status, "map failed: {:?}", e);
                                     }
                                 }
                             }
@@ -1041,23 +1052,31 @@ async fn main(spawner: Spawner) {
                 }
             }
         }
-        (Err(_), _, _) => {
-            let _ = core::write!(&mut control_status, "bad control key");
-        }
-        _ => {
-            let _ = core::write!(&mut control_status, "no device keys");
-        }
-    }
-    logln!("control: {}", control_status.as_str());
 
-    // The status rides on every tick rather than being logged once at boot:
-    // the host opens the CDC port during enumeration, so anything written
-    // before an actual reader attaches is drained into a connection nobody is
-    // listening to, and boot-time output is effectively unobservable.
-    let mut ticks = 0u32;
-    loop {
-        logln!("tick {} — {}, addr {}", ticks, control_status.as_str(), addr.as_str());
-        ticks = ticks.wrapping_add(1);
-        Timer::after(Duration::from_secs(5)).await;
+        // Reported on every attempt rather than once at boot: the host opens
+        // the CDC port during enumeration, so anything written before a reader
+        // actually attaches goes into a connection nobody is listening to.
+        logln!(
+            "control: {} — addr {}, reconnecting in {}s",
+            control_status.as_str(),
+            addr.as_str(),
+            backoff
+        );
+        Timer::after(Duration::from_secs(backoff)).await;
+        backoff = (backoff * 2).min(60);
+
+        // The WiFi join happens once, before this loop, so nothing here can
+        // recover from the radio losing its association — if the access point
+        // reboots, every attempt below fails forever against a link that is no
+        // longer there. A reset redoes the join, and after this many failures
+        // at full backoff the link is the likeliest suspect. Roughly ten
+        // minutes of failure, so a control plane having a bad afternoon does
+        // not put the device in a reboot loop.
+        consecutive_failures += 1;
+        if consecutive_failures >= 12 {
+            logln!("control: {} consecutive failures, resetting", consecutive_failures);
+            cortex_m::peripheral::SCB::sys_reset();
+        }
     }
 }
+
