@@ -51,13 +51,21 @@ use crate::logln;
 /// weighted by how a client actually uses them — a browser opens many
 /// connections to 80 and 443, while a control protocol on 37193 is mostly
 /// sequential but should not fail a burst either.
-pub const PORTS: [u16; 16] = [
+pub const PORTS: [u16; 19] = [
     // Web UIs, and the WebSocket control channel some devices upgrade from.
-    80, 80, 80, 80, 80, 80, //
+    80, 80, 80, 80, 80, //
     // Raw control protocols. A Lyngdorf amplifier takes commands here, and
     // speaks nothing until the client does — which the tunnel does not care
     // about, since it forwards bytes and never parses them.
-    84, 84, 84, 84, 84, //
+    84, 84, 84, 84, //
+    // Spotify Connect's zeroconf endpoint, where a client hands a speaker the
+    // credentials that log it in. Only pairing happens here: once logged in a
+    // speaker holds its own connection to Spotify and is controlled through
+    // Spotify's servers, which needs no LAN access at all.
+    8080, 8080, //
+    // Google Cast — 8009 is the protobuf control channel over TLS, 8008 its
+    // plain-HTTP sibling.
+    8009, 8009, 8008, //
     443, 443, //
     // UPnP/DLNA control.
     37193, 37193, 37193,
